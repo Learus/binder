@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Card Binder</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <aside id="sidebar">
+      <section class="panel">
+        <div class="row">
+          <select id="binder-select" title="Binder"></select>
+          <button id="binder-new" title="New binder">New</button>
+        </div>
+        <div class="row">
+          <button id="binder-rename">Rename</button>
+          <label class="color" title="Cover colour"><input type="color" id="binder-cover" /> Cover</label>
+          <button id="binder-delete" class="danger">Delete</button>
+        </div>
+        <div class="row">
+          <button id="binder-export" title="Save this binder to a file you can share">Export</button>
+          <button id="binder-import" title="Load a binder from an exported file">Import</button>
+          <input type="file" id="import-file" accept=".json,application/json" hidden />
+        </div>
+        <div class="row small">
+          <span id="binder-stats"></span>
+          <span class="spacer"></span>
+          <button id="sheet-remove" title="Remove the last sheet (2 pages)">− Sheet</button>
+          <button id="sheet-add" title="Add a sheet (2 pages)">+ Sheet</button>
+        </div>
+      </section>
+
+      <section class="panel search">
+        <div class="tabs" id="game-tabs">
+          <button data-game="pokemon">Pokémon</button>
+          <button data-game="mtg">Magic</button>
+          <button data-game="ygo">Yu-Gi-Oh!</button>
+        </div>
+        <form id="search-form" class="row">
+          <input id="search-input" type="search" placeholder="Search cards…" autocomplete="off" />
+          <button type="submit">Search</button>
+        </form>
+        <label class="row small">
+          <span>Rarity for new cards</span>
+          <select id="foil-select"></select>
+        </label>
+        <div id="target-info" class="small muted"></div>
+        <div id="search-status" class="small muted"></div>
+        <div id="results"></div>
+        <button id="load-more" hidden>Load more</button>
+      </section>
+    </aside>
+
+    <main id="stage">
+      <canvas id="view"></canvas>
+      <div id="pager">
+        <button id="prev" title="Previous page (←)">◀</button>
+        <span id="page-label"></span>
+        <button id="next" title="Next page (→)">▶</button>
+        <button id="close-toggle" class="pill" title="Close or open the binder (C)">Close</button>
+      </div>
+      <div id="hint">
+        Click a pocket to select it, then click a search result to put a card there. Click a card to look at it
+        up close. Ctrl+click a card to remove it, hover and press Ctrl+D to copy it. C closes the binder; click a
+        binder on the table to swap to it, or an empty slot to start a new one. Drag to orbit, right-drag to pan,
+        scroll to zoom, R to reset the view, T to see the whole table.
+      </div>
+      <div id="toast"></div>
+      <div id="inspect-panel" hidden>
+        <div id="inspect-name"></div>
+        <div id="inspect-set" class="small muted"></div>
+        <label class="small">Rarity <select id="inspect-foil"></select></label>
+        <div class="row">
+          <button id="inspect-flip">Flip</button>
+          <button id="inspect-select" title="Select this pocket to replace the card">Replace…</button>
+          <button id="inspect-remove" class="danger">Remove</button>
+          <button id="inspect-close">Close</button>
+        </div>
+        <div class="small muted">Move the mouse to tilt. Drag sideways to spin.</div>
+      </div>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
