@@ -49,13 +49,13 @@ export function studioEnvironment(renderer: THREE.WebGLRenderer): THREE.Texture 
 export function createLights(shadows: boolean): THREE.Object3D[] {
   // A desk lamp: a soft pool of warm light on the binder that falls off
   // across the table.
-  const lamp = new THREE.SpotLight('#ffe4c4', 2.4, 0, 0.62, 0.85, 0);
-  lamp.position.set(-26, 72, 36);
+  const lamp = new THREE.SpotLight('#ffe4c4', 2.4, 0, 0.72, 0.85, 0);
+  lamp.position.set(-30, 90, 42);
   if (shadows) {
     lamp.castShadow = true;
     lamp.shadow.mapSize.set(2048, 2048);
     lamp.shadow.camera.near = 30;
-    lamp.shadow.camera.far = 160;
+    lamp.shadow.camera.far = 220;
     lamp.shadow.bias = -0.0004;
     lamp.shadow.normalBias = 0.02;
     lamp.shadow.radius = 4;
@@ -68,12 +68,12 @@ export function createLights(shadows: boolean): THREE.Object3D[] {
 export function createTable(): THREE.Mesh {
   const tex = woodTexture();
   tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-  tex.repeat.set(1.6, 1.3);
+  tex.repeat.set(2.3, 1.9);
   tex.anisotropy = 8;
   const top = new THREE.MeshStandardMaterial({ map: tex, roughness: 0.62, envMapIntensity: 0.7 });
   const edge = new THREE.MeshStandardMaterial({ color: '#2c1a0e', roughness: 0.7 });
   // Box faces: +x, -x, +y, -y, +z, -z
-  const table = new THREE.Mesh(new THREE.BoxGeometry(170, 4, 110), [edge, edge, top, edge, edge, edge]);
+  const table = new THREE.Mesh(new THREE.BoxGeometry(250, 4, 170), [edge, edge, top, edge, edge, edge]);
   table.position.y = -2.5;
   table.receiveShadow = true;
   return table;

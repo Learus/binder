@@ -35,7 +35,14 @@ export function setDataDir(dir: string) {
 }
 setDataDir(process.env.BINDER_DATA_DIR ?? path.resolve(process.cwd(), 'data'));
 const USER_AGENT = 'LocalCardBinder/0.1 (personal, non-commercial)';
-const IMAGE_HOSTS = new Set(['cards.scryfall.io', 'images.ygoprodeck.com', 'assets.tcgdex.net']);
+const IMAGE_HOSTS = new Set([
+  'cards.scryfall.io',
+  'backs.scryfall.io',
+  'images.ygoprodeck.com',
+  'assets.tcgdex.net',
+  'images.pokemontcg.io',
+  'tcg.pokemon.com',
+]);
 const MIME: Record<string, string> = {
   jpg: 'image/jpeg',
   png: 'image/png',
@@ -140,7 +147,15 @@ async function listBinders(res: ServerResponse) {
     try {
       const b = JSON.parse(await fs.readFile(path.join(BINDER_DIR, f), 'utf8'));
       const cards = (b.pages as unknown[][]).flat().filter(Boolean).length;
-      out.push({ id: b.id, name: b.name, updatedAt: b.updatedAt, cards, cover: b.cover, sheets: b.pages.length / 2 });
+      out.push({
+        id: b.id,
+        name: b.name,
+        updatedAt: b.updatedAt,
+        cards,
+        cover: b.cover,
+        sheets: b.pages.length / 2,
+        layout: b.layout,
+      });
     } catch (err) {
       console.warn('[api] skipping unreadable binder', f, err);
     }
@@ -270,7 +285,9 @@ async function search(res: ServerResponse, url: URL) {
 }
 
 async function getJson(u: string): Promise<{ status: number; body: any }> {
-  const r = await fetch(u, { headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' } });
+  const r = await fetch(u, {
+    headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
+  });
   const text = await r.text();
   let body: any = null;
   try {
@@ -321,6 +338,69 @@ function pokemonSets() {
   return tcgdexSets;
 }
 
+// TCGdex has no images for some cards, mostly secret rares, gold cards,
+// subsets (Shiny Vault, Galarian Gallery, Classic Collection) and promos.
+// The Pokémon TCG API's card data on GitHub has most of them.
+const PTCG_DATA = 'https://raw.githubusercontent.com/PokemonTCG/pokemon-tcg-data/master';
+const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+const normNumber = (n: string) => norm(n).replace(/^0+(?=\d)/, '');
+
+let ptcgSetIds: Promise<{
+  ids: Set<string>;
+  byName: Map<string, string>;
+}> | null = null;
+function ptcgSets() {
+  ptcgSetIds ??= getJson(`${PTCG_DATA}/sets/en.json`)
+    .catch(() => ({ body: null }))
+    .then(({ body }) => {
+      const ids = new Set<string>();
+      const byName = new Map<string, string>();
+      for (const s of Array.isArray(body) ? body : []) {
+        ids.add(s.id);
+        byName.set(norm(s.name), s.id);
+      }
+      if (!ids.size) ptcgSetIds = null;
+      return { ids, byName };
+    });
+  return ptcgSetIds;
+}
+
+type PtcgCard = {
+  number: string;
+  name: string;
+  images: { small: string; large: string };
+};
+const ptcgSetCards = new Map<string, Promise<PtcgCard[]>>();
+function ptcgCards(setId: string) {
+  let p = ptcgSetCards.get(setId);
+  if (!p) {
+    p = getJson(`${PTCG_DATA}/cards/en/${setId}.json`)
+      .catch(() => ({ body: null }))
+      .then(({ body }) => {
+        if (!Array.isArray(body)) ptcgSetCards.delete(setId);
+        return Array.isArray(body) ? body : [];
+      });
+    ptcgSetCards.set(setId, p);
+  }
+  return p;
+}
+
+/** Images for a TCGdex card from the Pokémon TCG data: same set, then same number or a unique name. */
+async function ptcgImages(setId: string, setName: string, number: string, name: string) {
+  const { ids, byName } = await ptcgSets();
+  const ptSet =
+    [setId.replace(/\./g, ''), setId.replace(/\.5/g, 'pt5')].find((i) => ids.has(i)) ?? byName.get(norm(setName));
+  if (!ptSet) return null;
+  const cards = await ptcgCards(ptSet);
+  const num = normNumber(number);
+  const named = cards.filter((c) => norm(c.name) === norm(name));
+  const hit =
+    named.find((c) => normNumber(c.number) === num) ??
+    cards.find((c) => normNumber(c.number) === num && norm(c.name).startsWith(norm(name).slice(0, 4))) ??
+    (named.length === 1 ? named[0] : undefined);
+  return hit?.images ?? null;
+}
+
 async function searchTcgdex(q: string, page: number) {
   const per = 60;
   const u = new URL('https://api.tcgdex.net/v2/en/cards');
@@ -331,22 +411,33 @@ async function searchTcgdex(q: string, page: number) {
   if (status === 404) return { cards: [], hasMore: false };
   if (status !== 200) throw new Error(`TCGdex returned ${status}`);
 
-  const cards: CardRef[] = [];
-  for (const c of body as any[]) {
-    if (!c.image) continue;
-    const setId = c.id.slice(0, c.id.length - c.localId.length - 1);
-    cards.push({
-      game: 'pokemon',
-      id: c.id,
-      name: c.name,
-      set: sets.get(setId) ?? setId,
-      number: c.localId,
-      thumb: `${c.image}/low.webp`,
-      image: `${c.image}/high.webp`,
-      large: `${c.image}/high.webp`,
-    });
-  }
-  return { cards, hasMore: body.length === per };
+  const found = await Promise.all(
+    (body as any[]).map(async (c): Promise<CardRef | null> => {
+      const setId = c.id.slice(0, c.id.length - c.localId.length - 1);
+      const set = sets.get(setId) ?? setId;
+      const card = {
+        game: 'pokemon' as const,
+        id: c.id,
+        name: c.name,
+        set,
+        number: c.localId,
+      };
+      if (c.image) {
+        return {
+          ...card,
+          thumb: `${c.image}/low.webp`,
+          image: `${c.image}/high.webp`,
+          large: `${c.image}/high.webp`,
+        };
+      }
+      const img = await ptcgImages(setId, set, c.localId, c.name).catch(() => null);
+      return img && { ...card, thumb: img.small, image: img.large, large: img.large };
+    }),
+  );
+  return {
+    cards: found.filter((c) => c !== null),
+    hasMore: body.length === per,
+  };
 }
 
 async function searchYgo(q: string, page: number) {

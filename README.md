@@ -14,9 +14,9 @@ Windows SmartScreen may warn about an unrecognised app because the builds aren't
 
 The app stores binders and its image cache in your user data folder (File → Open data folder):
 
-- Windows: `%APPDATA%\Card Binder\data`
-- macOS: `~/Library/Application Support/Card Binder/data`
-- Linux: `~/.config/Card Binder/data`
+- Windows: `%APPDATA%\card-binder\data`
+- macOS: `~/Library/Application Support/card-binder/data`
+- Linux: `~/.config/card-binder/data`
 
 ## Sharing binders
 
@@ -26,8 +26,13 @@ The app stores binders and its image cache in your user data folder (File → Op
 
 - Click a pocket to select it, then click a search result to put the card there.
 - Click a card to inspect it. Ctrl+click removes it. Hover and press Ctrl+D to copy it to the next free pocket.
-- ←/→ turn pages, C closes or opens the binder, R resets the camera, T shows the whole table.
+- ←/→ or the arrows beside the binder turn pages, or drag a page by its outer edge like a book. Type a page number to turn straight to it. C (or the button under the binder) closes or opens it, R resets the camera, T shows the whole table.
+- Right-drag tilts the view up and down, middle-drag pans, the scroll wheel zooms.
 - Click a closed binder on the table to swap it with the open one. Click an empty slot to start a new binder there.
+- Each binder can hold 4, 9 or 16 pockets per page, in plastic sleeves or as graded slabs (4 per page). Changing it keeps your cards in order.
+- Binder styles: a classic ring binder with a paper label, a padded zippered binder, or a ringless Pro binder with an elastic strap.
+- Flip (F) in the close-up shows the card back for that game.
+- Yu-Gi-Oh! Ultimate and Gold Rares have a print age slider in the close-up (older ultimates are greyer, older gold is darker and glossier). Any Yu-Gi-Oh! card can use the old frame, with the shorter art window of early prints.
 
 ## Development
 
@@ -72,5 +77,6 @@ Images are fetched once through the local server and cached on disk.
 - `src/three/foilMap.ts`: per-card masks (title, stars, height, background)
 - `src/three/binderScene.ts`: scene, page turning, closing, table slots
 - `src/three/shelf.ts`: closed binders and table slot layout
+- `src/three/styles.ts`: binder styles (covers, zipper, strap)
 - `src/three/room.ts`: table, lighting and reflections
 - `src/main.ts`: UI wiring

@@ -19,6 +19,8 @@ export enum Pattern {
   Surge = 6,
   /** Ultimate rare: fine relief lines pressed across the surface. */
   ReliefLines = 7,
+  /** Super/ultra rare: the secret rare's rainbow, smooth (no ridges or specks). */
+  Sheen = 8,
 }
 
 /** Recolouring of the printed ink before the foil shows through it. */
@@ -54,12 +56,20 @@ export interface FoilPreset {
   outside: number;
   /** Overall foil brightness. */
   strength: number;
+  /** 0 = polished, 1 = rough brushed metal (broad, dim highlights, matte stock). */
+  rough: number;
   /** Outer border and art frame: plain, solid gold, or embossed relief. */
   trim: Trim;
   /** Darken and grey out the foiled parts (ultimate rare). */
   dim: number;
+  /** Default print age (0 new, 1 vintage) for rarities with an age slider; null for the rest. */
+  age: number | null;
   /** Level stars pressed in and darkened like the trim. */
   embossStars: boolean;
+  /** Level stars and attribute circle catch the light like foil. */
+  shinyIcons: boolean;
+  /** 0 = flat, 1 = the art sits darker, like a window set into the card. */
+  depth: number;
   /** 0 = pattern everywhere in the region, 1 = only on the art's background. */
   backgroundOnly: number;
 }
@@ -84,9 +94,13 @@ const p = (o: Partial<FoilPreset>): FoilPreset => ({
   glow: 0,
   outside: 1,
   strength: 1,
+  rough: 0,
   trim: Trim.None,
   dim: 0,
+  age: null,
   embossStars: false,
+  shinyIcons: false,
+  depth: 0,
   backgroundOnly: 0,
   ...o,
 });
@@ -135,11 +149,22 @@ export const RARITIES: Record<Game, Rarity[]> = {
   ygo: [
     { key: 'none', label: 'Common', preset: p({}) },
     { key: 'rare', label: 'Rare', preset: p({ name: NameFoil.Silver }) },
-    { key: 'super', label: 'Super Rare', preset: p({ region: Region.Art, rainbow: 0.9 }) },
+    {
+      key: 'super',
+      label: 'Super Rare',
+      preset: p({ region: Region.Art, pattern: Pattern.Sheen, rainbow: 0.75, depth: 1, shinyIcons: true }),
+    },
     {
       key: 'ultra',
       label: 'Ultra Rare',
-      preset: p({ region: Region.Art, rainbow: 0.9, name: NameFoil.Gold, glow: 0.5 }),
+      preset: p({
+        region: Region.Art,
+        pattern: Pattern.Sheen,
+        rainbow: 0.75,
+        name: NameFoil.Gold,
+        glow: 0.75,
+        shinyIcons: true,
+      }),
     },
     {
       key: 'secret',
@@ -152,13 +177,15 @@ export const RARITIES: Record<Game, Rarity[]> = {
       preset: p({
         region: Region.Art,
         pattern: Pattern.ReliefLines,
-        rainbow: 0.25,
-        metal: [1, 0.9, 0.72],
+        rainbow: 0.15,
+        metal: [1, 0.8, 0.5],
         name: NameFoil.Gold,
-        emboss: 1,
+        emboss: 1.4,
         trim: Trim.Relief,
-        dim: 0.75,
-        strength: 0.45,
+        dim: 0.7,
+        age: 0.5,
+        strength: 0.85,
+        rough: 1,
         embossStars: true,
       }),
     },
@@ -175,13 +202,49 @@ export const RARITIES: Record<Game, Rarity[]> = {
     {
       key: 'gold',
       label: 'Gold Rare',
-      preset: p({ region: Region.Art, pattern: Pattern.Secret, rainbow: 0.85, name: NameFoil.Gold, trim: Trim.Gold, backgroundOnly: 1 }),
+      // New prints: the art keeps its colours under a light, embossed gold
+      // sheen. Old prints: a plain holo art (the shader fades it by age).
+      preset: p({
+        region: Region.Art,
+        pattern: Pattern.Etched,
+        metal: GOLD,
+        rainbow: 0.3,
+        emboss: 0.3,
+        strength: 0.8,
+        name: NameFoil.Gold,
+        trim: Trim.Gold,
+        age: 0,
+      }),
+    },
+    {
+      key: 'goldsecret',
+      label: 'Gold Secret Rare',
+      preset: p({
+        region: Region.Full,
+        pattern: Pattern.Secret,
+        metal: [1, 0.86, 0.6],
+        rainbow: 0.75,
+        outside: 0.5,
+        name: NameFoil.Gold,
+        trim: Trim.Gold,
+      }),
     },
   ],
 };
 
 export function rarityOf(game: Game, foil: FoilKey): Rarity {
   return RARITIES[game].find((r) => r.key === foil) ?? RARITIES[game][0];
+}
+
+/** Whether a rarity has the age setting (Yu-Gi-Oh! ultimate and gold rares). */
+export function foilAges(game: Game, foil: FoilKey) {
+  return rarityOf(game, foil).preset.age !== null;
+}
+
+/** A card's print age: its own setting or the rarity's default. 0 for rarities without one. */
+export function printAge(game: Game, foil: FoilKey, age?: number) {
+  const def = rarityOf(game, foil).preset.age;
+  return def === null ? 0 : (age ?? def);
 }
 
 export function foilLabel(game: Game, foil: FoilKey): string {
@@ -200,6 +263,13 @@ export function normalizeFoil(game: Game, foil: string): FoilKey {
   const key = (LEGACY[game][foil] ?? foil) as FoilKey;
   return RARITIES[game].some((r) => r.key === key) ? key : 'none';
 }
+
+/** The standard card back of each game, fetched through the image cache like card art. */
+export const CARD_BACK: Record<Game, string> = {
+  pokemon: 'https://tcg.pokemon.com/assets/img/global/tcg-card-back-2x.jpg',
+  mtg: 'https://backs.scryfall.io/large/0/a/0aeebaf5-8c7d-4636-9e82-8c27447861f7.jpg',
+  ygo: 'https://images.ygoprodeck.com/images/cards/back.jpg',
+};
 
 /** Physical card size in cm and corner radius as a fraction of height. */
 export const CARD_SIZE: Record<Game, { w: number; h: number; r: number }> = {
@@ -234,4 +304,6 @@ export const YGO_FRAME = {
   inner: [0.032, 0.022, 0.968, 0.978] as [number, number, number, number],
   artFrame: [0.09, 0.165, 0.91, 0.725] as [number, number, number, number],
   stars: [0.06, 0.12, 0.94, 0.165] as [number, number, number, number],
+  /** Bounding box of the round attribute icon, top right. */
+  attr: [0.846, 0.04, 0.932, 0.11] as [number, number, number, number],
 };

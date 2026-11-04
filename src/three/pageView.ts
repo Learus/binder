@@ -1,11 +1,13 @@
 import * as THREE from 'three';
 import { CARD_SIZE } from '../foils';
-import type { Game, Slot } from '../types';
-import { SLOTS_PER_PAGE } from '../types';
+import type { BinderLayout, Game, Slot } from '../types';
 import { createCardMaterial, setCardFoilMap, setCardTexture, type SharedUniforms } from './holoMaterial';
+import { buildSlab, SLAB_CARD_Y, SLAB_CARD_Z, SLAB_H, SLAB_W, SlabKit } from './slab';
 import { coverLiningTexture, pageBackingTexture, type TextureCache } from './textures';
 
-// Binder layout in centimetres. A page is a 3x3 grid of pockets.
+// Page space, in centimetres. Every page has this size whatever its layout;
+// the pockets inside are scaled to fit, and the whole binder is then scaled
+// (see realScale) so cards come out at their real size.
 export const POCKET_W = 6.6;
 export const POCKET_H = 9.1;
 export const POCKET_GAP = 0.35;
@@ -13,11 +15,42 @@ export const PAGE_MARGIN = 0.6;
 export const PAGE_W = 3 * POCKET_W + 2 * POCKET_GAP + 2 * PAGE_MARGIN;
 export const PAGE_H = 3 * POCKET_H + 2 * POCKET_GAP + 2 * PAGE_MARGIN;
 
+/** How a layout's pockets sit on a page, in page space. */
+export interface PageGrid {
+  layout: BinderLayout;
+  cols: number;
+  cellW: number;
+  cellH: number;
+  /** Real size to page space: a pocket's contents are drawn at this scale. */
+  fit: number;
+  /** Pocket size in page space. */
+  pocketW: number;
+  pocketH: number;
+}
+
+export function gridOf(layout: BinderLayout): PageGrid {
+  const n = Math.round(Math.sqrt(layout.pockets));
+  const cellW = (PAGE_W - 2 * PAGE_MARGIN - (n - 1) * POCKET_GAP) / n;
+  const cellH = (PAGE_H - 2 * PAGE_MARGIN - (n - 1) * POCKET_GAP) / n;
+  const [rw, rh] = layout.type === 'slab' ? [SLAB_W + 0.3, SLAB_H + 0.3] : [POCKET_W, POCKET_H];
+  const fit = Math.min(cellW / rw, cellH / rh);
+  return { layout, cols: n, cellW, cellH, fit, pocketW: rw * fit, pocketH: rh * fit };
+}
+
+/** How much to scale a binder with this layout so its cards are real size. */
+export function realScale(layout: BinderLayout) {
+  return 1 / gridOf(layout).fit;
+}
+
 /** Pocket centre in page-local coordinates (x right, y towards the top edge). */
-export function slotCenter(i: number): { x: number; y: number } {
-  const col = i % 3;
-  const row = Math.floor(i / 3);
-  return { x: (col - 1) * (POCKET_W + POCKET_GAP), y: (1 - row) * (POCKET_H + POCKET_GAP) };
+export function slotCenter(i: number, grid: PageGrid): { x: number; y: number } {
+  const n = grid.cols;
+  const col = i % n;
+  const row = Math.floor(i / n);
+  return {
+    x: (col - (n - 1) / 2) * (grid.cellW + POCKET_GAP),
+    y: ((n - 1) / 2 - row) * (grid.cellH + POCKET_GAP),
+  };
 }
 
 export interface SlotHit {
@@ -27,11 +60,12 @@ export interface SlotHit {
 
 /** Shared GPU resources for every page so rebuilding a page is cheap. */
 export class PageKit {
-  readonly backingMat: THREE.MeshStandardMaterial;
   readonly sleeveMat: THREE.MeshStandardMaterial;
   readonly pageGeo = new THREE.PlaneGeometry(PAGE_W, PAGE_H);
   readonly sleeveGeo = new THREE.PlaneGeometry(POCKET_W - 0.08, POCKET_H - 0.08);
+  readonly slabs = new SlabKit();
   private cardGeos = new Map<Game, THREE.PlaneGeometry>();
+  private backings = new Map<string, THREE.MeshStandardMaterial>();
   private liningMat: THREE.MeshStandardMaterial | null = null;
   private liningColor = '';
 
@@ -39,11 +73,6 @@ export class PageKit {
     readonly shared: SharedUniforms,
     readonly textures: TextureCache,
   ) {
-    const rects = Array.from({ length: SLOTS_PER_PAGE }, (_, i) => ({ ...slotCenter(i), w: POCKET_W, h: POCKET_H }));
-    this.backingMat = new THREE.MeshStandardMaterial({
-      map: pageBackingTexture(PAGE_W, PAGE_H, rects),
-      roughness: 0.9,
-    });
     // Black, additive and glossy: only the environment reflection of the
     // plastic sleeve gets added on top of the card.
     this.sleeveMat = new THREE.MeshStandardMaterial({
@@ -55,6 +84,22 @@ export class PageKit {
       depthWrite: false,
       envMapIntensity: 0.55,
     });
+  }
+
+  /** Page backing with pocket outlines for a layout. */
+  backing(grid: PageGrid) {
+    const key = `${grid.cols}-${grid.layout.type}`;
+    let m = this.backings.get(key);
+    if (!m) {
+      const rects = Array.from({ length: grid.layout.pockets }, (_, i) => ({
+        ...slotCenter(i, grid),
+        w: grid.pocketW,
+        h: grid.pocketH,
+      }));
+      m = new THREE.MeshStandardMaterial({ map: pageBackingTexture(PAGE_W, PAGE_H, rects), roughness: 0.9 });
+      this.backings.set(key, m);
+    }
+    return m;
   }
 
   cardGeo(game: Game) {
@@ -86,6 +131,8 @@ export class PageView {
   readonly group = new THREE.Group();
   readonly hitTargets: THREE.Mesh[] = [];
   readonly cards: (THREE.Mesh<THREE.PlaneGeometry, THREE.ShaderMaterial> | null)[] = [];
+  /** What rises when a pocket is hovered: the card, or the whole slab. */
+  readonly lifts: (THREE.Object3D | null)[] = [];
   private pending: Promise<unknown>[] = [];
   private disposed = false;
 
@@ -95,7 +142,8 @@ export class PageView {
     slots: (Slot | null)[] | null,
     coverColor: string,
     /** Sleeves reflect the room straight back at an overhead snapshot camera, so leave them out there. */
-    withSleeves = true,
+    withSleeves: boolean,
+    layout: BinderLayout,
   ) {
     const face = new THREE.Group();
     face.rotation.x = -Math.PI / 2;
@@ -108,50 +156,76 @@ export class PageView {
       return;
     }
 
-    const backing = new THREE.Mesh(kit.pageGeo, kit.backingMat);
+    const grid = gridOf(layout);
+    const backing = new THREE.Mesh(kit.pageGeo, kit.backing(grid));
     backing.receiveShadow = true;
     face.add(backing);
-    for (let i = 0; i < SLOTS_PER_PAGE; i++) {
-      const c = slotCenter(i);
+
+    for (let i = 0; i < layout.pockets; i++) {
+      const c = slotCenter(i, grid);
       const slot = slots[i];
+      let card: THREE.Mesh<THREE.PlaneGeometry, THREE.ShaderMaterial> | null = null;
       if (slot) {
-        const mat = createCardMaterial(slot.card.game, slot.foil, kit.shared);
-        const mesh = new THREE.Mesh(kit.cardGeo(slot.card.game), mat);
-        mesh.position.set(c.x, c.y, 0.02);
-        mesh.userData.restZ = 0.02;
-        face.add(mesh);
-        this.cards.push(mesh);
-
-        const { image } = slot.card;
-        const ready = kit.textures.peek(image);
-        if (ready) setCardTexture(mat, ready);
-        else
-          this.pending.push(
-            kit.textures
-              .get(image)
-              .then((tex) => !this.disposed && setCardTexture(mat, tex))
-              .catch((err) => console.warn('card image failed', slot.card.name, err)),
-          );
-        const map = kit.textures.peekFoilMap(image);
-        if (map) setCardFoilMap(mat, map);
-        else
-          this.pending.push(
-            kit.textures
-              .getFoilMap(image, slot.card.game)
-              .then((m) => !this.disposed && setCardFoilMap(mat, m))
-              .catch((err) => console.warn('foil map failed', slot.card.name, err)),
-          );
-      } else {
-        this.cards.push(null);
+        card = new THREE.Mesh(kit.cardGeo(slot.card.game), createCardMaterial(slot.card.game, slot.foil, kit.shared, slot));
+        this.loadCard(kit, card, slot);
       }
+      this.cards.push(card);
 
-      const sleeve = new THREE.Mesh(kit.sleeveGeo, kit.sleeveMat);
-      sleeve.visible = withSleeves;
-      sleeve.position.set(c.x, c.y, 0.06);
-      sleeve.userData.hit = { page: pageIndex, slot: i } satisfies SlotHit;
-      face.add(sleeve);
-      this.hitTargets.push(sleeve);
+      let target: THREE.Mesh;
+      let lift: THREE.Object3D | null = card;
+      if (layout.type === 'slab' && slot && card) {
+        const slab = buildSlab(kit.slabs, slot.card, kit.sleeveMat);
+        slab.top.visible = withSleeves;
+        card.position.set(0, SLAB_CARD_Y, SLAB_CARD_Z);
+        slab.group.add(card);
+        slab.group.position.set(c.x, c.y, 0.02);
+        slab.group.scale.setScalar(grid.fit);
+        face.add(slab.group);
+        target = slab.top;
+        lift = slab.group;
+      } else {
+        if (card) {
+          card.position.set(c.x, c.y, 0.02);
+          card.scale.setScalar(grid.fit);
+          face.add(card);
+        }
+        target = new THREE.Mesh(kit.sleeveGeo, kit.sleeveMat);
+        target.visible = withSleeves;
+        target.position.set(c.x, c.y, 0.06);
+        target.scale.set(grid.pocketW / POCKET_W, grid.pocketH / POCKET_H, 1);
+        face.add(target);
+      }
+      if (lift) {
+        lift.userData.restZ = lift.position.z;
+        lift.userData.baseScale = grid.fit;
+      }
+      this.lifts.push(lift);
+      target.userData.hit = { page: pageIndex, slot: i } satisfies SlotHit;
+      this.hitTargets.push(target);
     }
+  }
+
+  private loadCard(kit: PageKit, mesh: THREE.Mesh<THREE.PlaneGeometry, THREE.ShaderMaterial>, slot: Slot) {
+    const mat = mesh.material;
+    const { image } = slot.card;
+    const ready = kit.textures.peek(image);
+    if (ready) setCardTexture(mat, ready);
+    else
+      this.pending.push(
+        kit.textures
+          .get(image)
+          .then((tex) => !this.disposed && setCardTexture(mat, tex))
+          .catch((err) => console.warn('card image failed', slot.card.name, err)),
+      );
+    const map = kit.textures.peekFoilMap(image);
+    if (map) setCardFoilMap(mat, map);
+    else
+      this.pending.push(
+        kit.textures
+          .getFoilMap(image, slot.card.game)
+          .then((m) => !this.disposed && setCardFoilMap(mat, m))
+          .catch((err) => console.warn('foil map failed', slot.card.name, err)),
+      );
   }
 
   /** Resolves when card textures are in, or after `timeoutMs`. */

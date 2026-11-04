@@ -105,6 +105,18 @@ button.danger:hover {
   min-height: 0;
 }
 
+label.inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  flex: 1;
+}
+
+label.inline select {
+  flex: 1;
+}
+
 .color {
   display: flex;
   align-items: center;
@@ -197,9 +209,8 @@ button.danger:hover {
 
 #pager {
   position: absolute;
-  left: 50%;
-  bottom: 16px;
-  transform: translateX(-50%);
+  left: 0;
+  top: 0;
   display: flex;
   gap: 10px;
   align-items: center;
@@ -208,18 +219,33 @@ button.danger:hover {
   border-radius: 999px;
   padding: 5px 8px;
   backdrop-filter: blur(6px);
-}
-
-#pager button {
-  border-radius: 999px;
-  width: 34px;
-  height: 30px;
-  padding: 0;
+  will-change: transform;
 }
 
 #pager button.pill {
-  width: auto;
+  border-radius: 999px;
+  height: 30px;
   padding: 0 12px;
+}
+
+/* Placed beside the open binder every frame by main.ts. */
+.page-arrow {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border-radius: 999px;
+  font-size: 16px;
+  background: rgba(22, 24, 30, 0.75);
+  border: 1px solid var(--line);
+  backdrop-filter: blur(6px);
+  will-change: transform;
+}
+
+.page-arrow:disabled {
+  visibility: hidden;
 }
 
 #page-label {
@@ -274,8 +300,14 @@ button.danger:hover {
   border-radius: 10px;
 }
 
-#inspect-panel[hidden] {
+#inspect-panel[hidden],
+#inspect-panel label[hidden] {
   display: none;
+}
+
+#inspect-age {
+  width: 100%;
+  accent-color: #c9a45a;
 }
 
 #inspect-panel .row {
@@ -286,6 +318,16 @@ button.danger:hover {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+#inspect-panel label.check {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+}
+
+#inspect-old {
+  accent-color: #c9a45a;
 }
 
 #inspect-name {

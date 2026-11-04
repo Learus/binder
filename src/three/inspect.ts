@@ -1,9 +1,11 @@
 import * as THREE from 'three';
-import { CARD_SIZE } from '../foils';
-import type { Game, Slot } from '../types';
+import { imgUrl } from '../api';
+import { CARD_BACK, CARD_SIZE } from '../foils';
+import type { Game, PrintLook, Slot } from '../types';
 import { createCardMaterial, createSharedUniforms, setCardFoil, setCardFoilMap, setCardTexture } from './holoMaterial';
 import type { BinderScene } from './binderScene';
 import { cardBackTexture, queueFoilMap } from './textures';
+import { buildSlab, SLAB_CARD_Y, SLAB_CARD_Z, SLAB_H, SLAB_T, SLAB_W, SlabKit } from './slab';
 
 /** Close-up view of one card, drawn on top of the binder. */
 export class InspectView {
@@ -15,6 +17,8 @@ export class InspectView {
   private back: THREE.Mesh<THREE.PlaneGeometry, THREE.ShaderMaterial> | null = null;
   private dim: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshBasicMaterial>;
   private genericBack = cardBackTexture();
+  /** Each game's card back, loaded once and kept for the session. */
+  private backs = new Map<Game, Promise<THREE.Texture | null>>();
   private pointer = new THREE.Vector2();
   private flipped = false;
   private open = 0; // 0..1 animation
@@ -28,6 +32,19 @@ export class InspectView {
   /** Large textures loaded by this view; binder textures stay owned by the cache. */
   private owned: THREE.Texture[] = [];
   private game: Game = 'pokemon';
+  private slabKit = new SlabKit();
+  private slabTop = new THREE.MeshStandardMaterial({
+    color: 0x000000,
+    roughness: 0.15,
+    transparent: true,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+  private slab: THREE.Group | null = null;
+  /** Size of what's on show, for fitting it to the view. */
+  private viewW = 6.3;
+  private viewH = 8.8;
 
   constructor(private host: BinderScene) {
     this.camera.position.set(0, 0, 22);
@@ -37,6 +54,8 @@ export class InspectView {
     );
     this.dim.position.z = -30;
     this.scene.add(this.dim, this.card);
+    // Same reflections as the binder, for the slab's acrylic.
+    this.scene.environment = host.scene.environment;
 
     const canvas = host.renderer.domElement;
     canvas.addEventListener('pointermove', (e) => {
@@ -71,17 +90,31 @@ export class InspectView {
     return this.active;
   }
 
-  show(slot: Slot) {
+  /** Show a card up close; `inSlab` puts it in its graded slab. */
+  show(slot: Slot, inSlab = false) {
     this.clearCard();
     const token = ++this.token;
     const game = slot.card.game;
     const size = CARD_SIZE[game];
     const geo = new THREE.PlaneGeometry(size.w, size.h);
 
-    this.front = new THREE.Mesh(geo, createCardMaterial(game, slot.foil, this.shared));
+    this.front = new THREE.Mesh(geo, createCardMaterial(game, slot.foil, this.shared, slot));
     this.back = new THREE.Mesh(geo, createCardMaterial(game, 'none', this.shared));
     this.back.rotation.y = Math.PI;
-    this.card.add(this.front, this.back);
+    if (inSlab) {
+      const slab = buildSlab(this.slabKit, slot.card, this.slabTop);
+      // Centre the slab on the spin axis.
+      slab.group.position.z = -SLAB_T / 2;
+      this.front.position.set(0, SLAB_CARD_Y, SLAB_CARD_Z);
+      this.back.position.set(0, SLAB_CARD_Y, SLAB_CARD_Z - 0.01);
+      slab.group.add(this.front, this.back);
+      this.card.add(slab.group);
+      this.slab = slab.group;
+      [this.viewW, this.viewH] = [SLAB_W, SLAB_H];
+    } else {
+      this.card.add(this.front, this.back);
+      [this.viewW, this.viewH] = [size.w, size.h];
+    }
 
     this.game = game;
     const front = this.front.material;
@@ -118,6 +151,10 @@ export class InspectView {
     });
     setCardTexture(this.back.material, this.genericBack);
     if (slot.card.back) load(slot.card.back, this.back.material);
+    else {
+      const back = this.back.material;
+      this.gameBack(game).then((tex) => tex && token === this.token && setCardTexture(back, tex));
+    }
 
     this.flipped = false;
     this.spinY = 0;
@@ -126,8 +163,8 @@ export class InspectView {
     this.host.blockInput = true;
   }
 
-  setFoil(foil: Slot['foil']) {
-    if (this.front) setCardFoil(this.front.material, this.game, foil);
+  setFoil(foil: Slot['foil'], look: PrintLook = {}) {
+    if (this.front) setCardFoil(this.front.material, this.game, foil, look);
   }
 
   flip() {
@@ -141,6 +178,26 @@ export class InspectView {
     this.drag = null;
   }
 
+  private gameBack(game: Game) {
+    let p = this.backs.get(game);
+    if (!p) {
+      p = new THREE.TextureLoader()
+        .loadAsync(imgUrl(CARD_BACK[game]))
+        .then((tex) => {
+          tex.colorSpace = THREE.SRGBColorSpace;
+          tex.anisotropy = this.host.renderer.capabilities.getMaxAnisotropy();
+          return tex;
+        })
+        .catch((err) => {
+          console.warn('card back failed', game, err);
+          this.backs.delete(game);
+          return null;
+        });
+      this.backs.set(game, p);
+    }
+    return p;
+  }
+
   private clearCard() {
     for (const m of [this.front, this.back]) {
       if (!m) continue;
@@ -149,6 +206,8 @@ export class InspectView {
     }
     this.front?.geometry.dispose();
     this.front = this.back = null;
+    this.slab?.removeFromParent();
+    this.slab = null;
     for (const t of this.owned) t.dispose();
     this.owned = [];
   }
@@ -166,8 +225,8 @@ export class InspectView {
     this.camera.updateProjectionMatrix();
     // Fit card height to ~80% of the view, minding narrow windows.
     const vFov = THREE.MathUtils.degToRad(this.camera.fov / 2);
-    const fitH = 8.8 / (2 * Math.tan(vFov) * 0.8);
-    const fitW = 6.3 / (2 * Math.tan(vFov) * this.camera.aspect * 0.55);
+    const fitH = this.viewH / (2 * Math.tan(vFov) * 0.8);
+    const fitW = this.viewW / (2 * Math.tan(vFov) * this.camera.aspect * 0.55);
     this.camera.position.z = Math.max(fitH, fitW);
     this.dim.position.z = this.camera.position.z - 40;
 

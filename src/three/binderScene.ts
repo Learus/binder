@@ -1,11 +1,13 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import type { Binder } from '../types';
+import { layoutOf, type Binder, type BinderLayout } from '../types';
 import { createSharedUniforms, type SharedUniforms } from './holoMaterial';
 import { Flipper } from './flipper';
-import { PAGE_H, PAGE_W, PageKit, PageView, POCKET_H, POCKET_W, slotCenter, type SlotHit } from './pageView';
+import { gridOf, PAGE_H, PAGE_W, PageKit, PageView, POCKET_H, POCKET_W, realScale, slotCenter, type SlotHit } from './pageView';
+import { SLAB_T } from './slab';
 import { TextureCache } from './textures';
 import { createLights, createTable, ROOM_COLOR, studioEnvironment } from './room';
+import { boardGeometry, coverNameTexture, elasticStrap, hasRings, stitchOverlay, styleCoverMaterial, zipGusset, zipperRim } from './styles';
 import {
   BASE_Y,
   BOARD,
@@ -29,8 +31,24 @@ const easeInOut = (t: number) => (t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 
 
 interface Turn {
   dir: 1 | -1;
-  t: number;
   target: number;
+  /** How far the turn has gone, 0 = not started, 1 = done. */
+  e: number;
+  /** While true the pointer sets `e`; otherwise `e` animates from `from` to `to`. */
+  drag: boolean;
+  from: number;
+  to: number;
+  t: number;
+  dur: number;
+}
+
+/** A left-press on a page's outer edge that may become a drag-turn. */
+interface EdgeGrab {
+  dir: 1 | -1;
+  x: number;
+  y: number;
+  /** Distance of the grab point from the spine, in binder space. */
+  r: number;
 }
 
 export interface BinderSceneEvents {
@@ -74,11 +92,17 @@ export class BinderScene {
   private env: THREE.Texture;
 
   private binder: Binder | null = null;
+  private layout: BinderLayout = layoutOf(null);
+  /** Page space to world: makes the cards real size for this layout. */
+  private scale = 1;
   private spread = 0;
   private left: PageView | null = null;
   private right: PageView | null = null;
   private turn: Turn | null = null;
+  private edgeGrab: EdgeGrab | null = null;
   private queued: (1 | -1)[] = [];
+  /** A spread typed in while a turn was running. */
+  private queuedSpread: number | null = null;
 
   private coverMat = new THREE.MeshStandardMaterial({ color: '#5b2333', roughness: 0.7 });
   private stackMat = new THREE.MeshStandardMaterial({ color: '#d9d6cf', roughness: 0.9 });
@@ -107,6 +131,14 @@ export class BinderScene {
   private spinePanel: THREE.Mesh;
   private rings: THREE.Mesh[] = [];
   private frontPlate: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshStandardMaterial>;
+  private boards: THREE.Mesh[] = [];
+  private spine: THREE.Mesh;
+  private spineGlass: THREE.Material;
+  // Style parts, shown or hidden by applyStyle.
+  private stitches: THREE.Object3D[] = [];
+  private zipRims: THREE.Object3D[] = [];
+  private gusset: ReturnType<typeof zipGusset>;
+  private strap: ReturnType<typeof elasticStrap>;
   private closeAmount = 0;
   private busy = false;
   private tweens: Tween[] = [];
@@ -127,6 +159,8 @@ export class BinderScene {
     this.renderer.autoClear = false;
     this.textures = new TextureCache(this.renderer.capabilities.getMaxAnisotropy());
     this.kit = new PageKit(this.shared, this.textures);
+    // Cards are small on screen in the binder, so let their foils show more.
+    this.shared.uFoilBoost.value = 1.4;
 
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFShadowMap;
@@ -134,7 +168,7 @@ export class BinderScene {
     this.scene.environment = this.env;
     this.scene.environmentIntensity = 1;
     this.scene.background = new THREE.Color(ROOM_COLOR);
-    this.scene.fog = new THREE.Fog(ROOM_COLOR, 110, 260);
+    this.scene.fog = new THREE.Fog(ROOM_COLOR, 170, 380);
     this.scene.add(...createLights(true));
     this.snapScene.environment = this.env;
     this.snapScene.environmentIntensity = 1;
@@ -158,12 +192,33 @@ export class BinderScene {
     for (const b of [leftBoard, rightBoard]) b.castShadow = b.receiveShadow = true;
     this.leftHalf.add(leftBoard);
     this.root.add(rightBoard);
-    const spine = new THREE.Mesh(
-      new THREE.BoxGeometry(SPINE_GAP * 1.6, BOARD + 0.01, DEPTH + 0.01),
-      new THREE.MeshStandardMaterial({ color: '#000', roughness: 0.6, transparent: true, opacity: 0.35 }),
-    );
-    spine.position.y = COVER_TOP - BOARD / 2;
-    this.root.add(spine);
+    this.boards = [leftBoard, rightBoard];
+    this.spineGlass = new THREE.MeshStandardMaterial({ color: '#000', roughness: 0.6, transparent: true, opacity: 0.35 });
+    this.spine = new THREE.Mesh(new THREE.BoxGeometry(SPINE_GAP * 1.6, BOARD + 0.01, DEPTH + 0.01), this.spineGlass);
+    this.spine.position.y = COVER_TOP - BOARD / 2;
+    this.root.add(this.spine);
+
+    // Ringless styles: stitched seams on both faces of each cover.
+    for (const b of [leftBoard, rightBoard]) {
+      const up = stitchOverlay(HALF, DEPTH);
+      up.position.y = BOARD / 2 + 0.004;
+      const down = stitchOverlay(HALF, DEPTH);
+      down.rotation.x = Math.PI / 2;
+      down.position.y = -BOARD / 2 - 0.004;
+      b.add(up, down);
+      this.stitches.push(up, down);
+    }
+    // Zippered: half a zipper round each cover, and the gusset once closed.
+    const leftRim = zipperRim(-1, HALF, BOARD, DEPTH);
+    const rightRim = zipperRim(1, HALF, BOARD, DEPTH);
+    leftBoard.add(leftRim);
+    rightBoard.add(rightRim);
+    this.zipRims = [leftRim, rightRim];
+    this.gusset = zipGusset(this.coverMat, 0, HALF, DEPTH);
+    this.root.add(this.gusset.group);
+    // Pro: elastic strap round the closed binder, near the fore-edge.
+    this.strap = elasticStrap(HALF - 2.8, DEPTH);
+    this.root.add(this.strap.group);
 
     // Outside of the front cover: faces down while open, up once closed.
     this.frontPlate = namePlate('', 0);
@@ -220,12 +275,20 @@ export class BinderScene {
     this.controls.enableDamping = true;
     this.controls.maxPolarAngle = 1.25;
     this.controls.minDistance = 12;
-    this.controls.maxDistance = 160;
-    this.controls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
+    this.controls.maxDistance = 260;
+    // Left button is for clicking and turning pages; right-drag tilts the
+    // view up and down (never sideways), middle-drag pans, the wheel zooms.
+    this.controls.mouseButtons = { LEFT: null, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE };
+    this.controls.minAzimuthAngle = 0;
+    this.controls.maxAzimuthAngle = 0;
     this.resetView();
 
-    canvas.addEventListener('pointermove', (e) => this.onPointerMove(e));
-    canvas.addEventListener('pointerdown', (e) => (this.pointerDown = { x: e.clientX, y: e.clientY }));
+    canvas.addEventListener('pointermove', (e) => {
+      this.onPointerMove(e);
+      this.dragTurn(e);
+    });
+    canvas.addEventListener('pointercancel', () => this.releaseDrag());
+    canvas.addEventListener('pointerdown', (e) => this.onPointerDown(e));
     canvas.addEventListener('pointerup', (e) => this.onPointerUp(e));
     canvas.addEventListener('pointerleave', () => this.pointer.set(9, 9));
     new ResizeObserver(() => this.resize()).observe(canvas);
@@ -281,9 +344,20 @@ export class BinderScene {
 
   setBinder(b: Binder, spread = 0, closed = false) {
     this.binder = b;
+    this.layout = layoutOf(b);
+    const scale = realScale(this.layout);
+    const resized = scale !== this.scale;
+    this.scale = scale;
+    this.root.scale.setScalar(scale);
+    // A bigger or smaller binder needs the camera pulled back or in.
+    if (resized) this.fitToView();
+    const grid = gridOf(this.layout);
+    this.highlight.scale.set((grid.pocketW + 0.3) / (POCKET_W + 0.3), (grid.pocketH + 0.3) / (POCKET_H + 0.3), 1);
     this.coverMat.color.set(b.cover);
+    this.applyStyle();
     this.turn = null;
     this.queued = [];
+    this.queuedSpread = null;
     this.flipper.group.visible = false;
     this.spread = Math.min(spread, this.spreadCount - 1);
     this.rebuild();
@@ -360,15 +434,27 @@ export class BinderScene {
   updateFrontPlate() {
     if (!this.binder) return;
     const mat = this.frontPlate.material;
+    const { style } = this.layout;
+    const cards = this.binder.pages.flat().filter(Boolean).length;
     mat.map?.dispose();
-    mat.map = labelTexture(this.binder.name, this.binder.pages.flat().filter(Boolean).length);
+    mat.map = style === 'ring' ? labelTexture(this.binder.name, cards) : coverNameTexture(this.binder.name, cards, style);
+    mat.transparent = style !== 'ring';
     mat.needsUpdate = true;
+  }
+
+  /** Cover surface, board shape and the parts that belong to the binder style. */
+  private applyStyle() {
+    const { style } = this.layout;
+    styleCoverMaterial(this.coverMat, style);
+    for (const b of this.boards) b.geometry = boardGeometry(style, HALF, BOARD, DEPTH);
+    this.spine.material = hasRings(style) ? this.spineGlass : this.coverMat;
+    for (const s of this.stitches) s.visible = style !== 'ring';
   }
 
   /** Pull the camera back to show the whole table. */
   tableView() {
-    this.controls.target.set(0, 0, -10);
-    this.camera.position.set(0, 128, 72);
+    this.controls.target.set(0, 0, -12);
+    this.camera.position.set(0, 175, 100);
     this.controls.update();
   }
 
@@ -391,10 +477,48 @@ export class BinderScene {
   turnPage(dir: 1 | -1) {
     if (this.busy || this.closeAmount > 0) return;
     if (this.turn) {
+      this.queuedSpread = null;
       if (this.queued.length < 2) this.queued.push(dir);
       return;
     }
     void this.startTurn(dir);
+  }
+
+  /** Turn straight to a spread, in one sheet turn. */
+  turnTo(spread: number) {
+    spread = THREE.MathUtils.clamp(spread, 0, this.spreadCount - 1);
+    if (this.busy || this.closeAmount > 0) return;
+    if (this.turn) {
+      // Go there once the current turn lands.
+      this.queued = [];
+      this.queuedSpread = spread;
+      return;
+    }
+    if (spread !== this.spread) void this.startTurn(spread > this.spread ? 1 : -1, false, spread);
+  }
+
+  /**
+   * Where the binder is on screen, in CSS pixels from the canvas's top left:
+   * the middle of its left and right edges and the middle of its near edge.
+   * Null when it's behind the camera.
+   */
+  screenBounds(): { left: THREE.Vector2; right: THREE.Vector2; bottom: THREE.Vector2 } | null {
+    const w = this.canvas.clientWidth;
+    const h = this.canvas.clientHeight;
+    const outer = HALF;
+    // Closed, only the right half is left (shifted to the middle by the root).
+    const x0 = THREE.MathUtils.lerp(-outer, 0, this.closeAmount);
+    const y = COVER_TOP;
+    const toScreen = (x: number, z: number) => {
+      const p = this.root.localToWorld(new THREE.Vector3(x, y, z)).project(this.camera);
+      return p.z > 1 ? null : new THREE.Vector2(((p.x + 1) / 2) * w, ((1 - p.y) / 2) * h);
+    };
+    const left = toScreen(x0, 0);
+    const right = toScreen(outer, 0);
+    const near = [toScreen(x0, DEPTH / 2), toScreen(outer, DEPTH / 2)];
+    if (!left || !right || !near[0] || !near[1]) return null;
+    const bottom = new THREE.Vector2((near[0].x + near[1].x) / 2, Math.max(near[0].y, near[1].y));
+    return { left, right, bottom };
   }
 
   setSelected(hit: SlotHit | null) {
@@ -418,7 +542,7 @@ export class BinderScene {
 
   private makePage(page: number | null, withSleeves = true): PageView {
     const b = this.binder!;
-    return new PageView(this.kit, page, page === null ? null : b.pages[page], b.cover, withSleeves);
+    return new PageView(this.kit, page, page === null ? null : b.pages[page], b.cover, withSleeves, this.layout);
   }
 
   private placePage(view: PageView, side: 'left' | 'right', y: number) {
@@ -442,8 +566,9 @@ export class BinderScene {
     this.pivot.position.y = h0;
     this.leftHalf.position.y = -h0;
     this.pivot.rotation.z = -Math.PI * e;
-    this.root.position.x = (-HALF / 2) * e;
-    const ring = Math.max(0, 1 - e * 3);
+    this.root.position.x = (-HALF / 2) * e * this.scale;
+    const { style } = this.layout;
+    const ring = hasRings(style) ? Math.max(0, 1 - e * 3) : 0;
     for (const r of this.rings) {
       r.scale.setScalar(Math.max(ring, 0.0001));
       r.visible = ring > 0;
@@ -453,6 +578,11 @@ export class BinderScene {
     const height = 2 * h0 + 2 * BOARD;
     this.spinePanel.scale.y = Math.max(wall * height, 0.001);
     this.spinePanel.position.set(-BOARD / 2, COVER_TOP - BOARD + (wall * height) / 2, 0);
+    for (const rim of this.zipRims) rim.visible = style === 'zip' && wall === 0;
+    this.gusset.group.visible = style === 'zip' && wall > 0;
+    if (wall > 0) this.gusset.set(COVER_TOP - BOARD / 2, Math.max(wall * (height - BOARD), 0.001));
+    this.strap.group.visible = style === 'pro' && e >= 1;
+    this.strap.set(COVER_TOP - BOARD, height);
     if (e > 0) this.highlight.visible = false;
   }
 
@@ -521,7 +651,7 @@ export class BinderScene {
     const side = sel && !this.turn && this.closeAmount === 0 ? (sel.page === l ? 'left' : sel.page === r ? 'right' : null) : null;
     this.highlight.visible = side !== null;
     if (!side || !sel) return;
-    const c = slotCenter(sel.slot);
+    const c = slotCenter(sel.slot, gridOf(this.layout));
     const h = this.stackHeights(this.spread);
     this.highlight.position.set(
       (side === 'left' ? -1 : 1) * (SPINE_GAP + PAGE_W / 2) + c.x,
@@ -544,16 +674,19 @@ export class BinderScene {
 
   // ---------- turning ----------
 
-  private async startTurn(dir: 1 | -1) {
-    const target = this.spread + dir;
-    if (!this.binder || target < 0 || target >= this.spreadCount) return;
-    this.turn = { dir, t: 0, target };
+  /** Turn one sheet; with `to`, the sheet lands on that spread, skipping the ones between. */
+  private async startTurn(dir: 1 | -1, drag = false, to = this.spread + dir) {
+    const target = to;
+    if (!this.binder || target < 0 || target >= this.spreadCount || target === this.spread) return;
+    this.turn = { dir, target, e: 0, drag, from: 0, to: 1, t: 0, dur: TURN_SECONDS };
     this.highlight.visible = false;
 
-    // The sheet that moves: forward = the right page's sheet, backward = the left page's sheet.
-    const sheet = dir === 1 ? this.spread : this.spread - 1;
-    const frontPage = 2 * sheet;
-    const backPage = 2 * sheet + 1;
+    // The moving sheet shows the page it lifts off one side and the page it
+    // lands with on the other: forward = this right page, then the target's
+    // left page; backward = the target's right page, then this left page.
+    const [lo, hi] = dir === 1 ? [this.spread, target] : [target, this.spread];
+    const frontPage = 2 * lo;
+    const backPage = 2 * hi - 1;
     // Sequential: both snapshots share one offscreen scene.
     await this.snapshot(frontPage, this.flipper.frontRT);
     await this.snapshot(backPage, this.flipper.backRT);
@@ -581,22 +714,34 @@ export class BinderScene {
   private stepTurn(dt: number) {
     const turn = this.turn!;
     if (!this.flipper.group.visible) return; // still taking snapshots
-    turn.t = Math.min(1, turn.t + dt / TURN_SECONDS);
-    const e = easeInOut(turn.t);
-    const progress = turn.dir === 1 ? e : 1 - e;
+    if (!turn.drag) {
+      turn.t = Math.min(1, turn.t + dt / turn.dur);
+      // A full turn eases in and out; finishing a drag only eases out.
+      const k = turn.from === 0 && turn.to === 1 ? easeInOut(turn.t) : 1 - (1 - turn.t) ** 2;
+      turn.e = turn.from + (turn.to - turn.from) * k;
+    }
+    const progress = turn.dir === 1 ? turn.e : 1 - turn.e;
     const lo = Math.min(this.spread, turn.target);
     const h = this.stackHeights(lo);
-    const hNext = this.stackHeights(lo + 1);
-    this.flipper.update(progress, turn.dir, h.right, hNext.left);
+    const hNext = this.stackHeights(Math.max(this.spread, turn.target));
+    // Slabs stand up off the page; the turning sheet lies on top of them.
+    const above = this.layout.type === 'slab' ? SLAB_T * gridOf(this.layout).fit + 0.05 : 0;
+    this.flipper.update(progress, turn.dir, h.right + above, hNext.left + above);
 
-    if (turn.t >= 1) {
-      this.spread = turn.target;
+    if (!turn.drag && turn.t >= 1) {
+      const done = turn.to === 1;
+      if (done) this.spread = turn.target;
       this.turn = null;
       this.flipper.group.visible = false;
       this.rebuild();
-      this.events.onSpreadChange(this.spread);
+      if (done) this.events.onSpreadChange(this.spread);
       const next = this.queued.shift();
       if (next) void this.startTurn(next);
+      else if (this.queuedSpread !== null) {
+        const spread = this.queuedSpread;
+        this.queuedSpread = null;
+        this.turnTo(spread);
+      }
     }
   }
 
@@ -607,9 +752,80 @@ export class BinderScene {
     this.pointer.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
   }
 
+  /**
+   * Where the pointer meets the open pages, in binder space (the root's local
+   * frame), or null when the binder isn't open and idle.
+   */
+  private pagePoint(): THREE.Vector3 | null {
+    if (this.closeAmount > 0 || this.busy || !this.binder) return null;
+    const h = this.stackHeights(this.spread);
+    const top = this.root.localToWorld(new THREE.Vector3(0, Math.max(h.left, h.right), 0)).y;
+    this.raycaster.setFromCamera(this.pointer, this.camera);
+    const p = new THREE.Vector3();
+    if (!this.raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0), -top), p)) return null;
+    return this.root.worldToLocal(p);
+  }
+
+  /** The page edge under the pointer that can be dragged to turn, if any. */
+  private edgeUnderPointer(): EdgeGrab | null {
+    if (this.turn || this.blockInput) return null;
+    const p = this.pagePoint();
+    if (!p || Math.abs(p.z) > PAGE_H / 2) return null;
+    const inner = SPINE_GAP + PAGE_W * 0.7;
+    const outer = SPINE_GAP + PAGE_W + 0.5;
+    const r = Math.abs(p.x);
+    if (r < inner || r > outer) return null;
+    const dir = p.x > 0 ? 1 : -1;
+    const target = this.spread + dir;
+    if (target < 0 || target >= this.spreadCount) return null;
+    return { dir, x: 0, y: 0, r: Math.min(r, SPINE_GAP + PAGE_W) };
+  }
+
+  private onPointerDown(e: PointerEvent) {
+    this.pointerDown = { x: e.clientX, y: e.clientY };
+    this.onPointerMove(e);
+    const grab = e.button === 0 ? this.edgeUnderPointer() : null;
+    this.edgeGrab = grab && { ...grab, x: e.clientX, y: e.clientY };
+    if (grab) this.canvas.setPointerCapture(e.pointerId);
+  }
+
+  /** Drag-turning: the page's free edge follows the pointer around the spine. */
+  private dragTurn(e: PointerEvent) {
+    const grab = this.edgeGrab;
+    if (!grab) return;
+    if (!this.turn) {
+      // Becomes a turn once the pointer moves towards the spine; a plain
+      // click on the edge still picks the pocket there.
+      const dx = (e.clientX - grab.x) * -grab.dir;
+      if (dx < 8 || this.busy || this.closeAmount > 0) return;
+      this.canvas.style.cursor = 'grabbing';
+      void this.startTurn(grab.dir, true);
+    }
+    const turn = this.turn;
+    if (!turn?.drag) return;
+    const p = this.pagePoint();
+    if (!p) return;
+    const progress = Math.acos(THREE.MathUtils.clamp(p.x / grab.r, -1, 1)) / Math.PI;
+    turn.e = turn.dir === 1 ? progress : 1 - progress;
+  }
+
+  /** Let go of a dragged page: it falls the way it's leaning. */
+  private releaseDrag() {
+    const turn = this.turn;
+    this.edgeGrab = null;
+    if (!turn?.drag) return;
+    turn.drag = false;
+    turn.from = turn.e;
+    turn.to = turn.e > 0.5 ? 1 : 0;
+    turn.t = 0;
+    turn.dur = Math.max(0.15, TURN_SECONDS * Math.abs(turn.to - turn.from));
+  }
+
   private onPointerUp(e: PointerEvent) {
     const down = this.pointerDown;
     this.pointerDown = null;
+    if (this.turn?.drag) return this.releaseDrag();
+    this.edgeGrab = null;
     if (!down || this.blockInput || this.busy || e.button !== 0) return;
     if (Math.hypot(e.clientX - down.x, e.clientY - down.y) > 5) return; // that was a drag
     const hit = this.pick();
@@ -660,8 +876,9 @@ export class BinderScene {
 
   /** Move the camera along its current direction until the open binder fits. */
   private fitToView() {
-    const halfW = SPINE_GAP + PAGE_W + 1.5;
-    const halfH = PAGE_H / 2 + 1.5;
+    // Room at the sides for the page arrows.
+    const halfW = (HALF + 3) * this.scale;
+    const halfH = (PAGE_H / 2 + 1.5) * this.scale;
     const vFov = THREE.MathUtils.degToRad(this.camera.fov) / 2;
     const hFov = Math.atan(Math.tan(vFov) * this.camera.aspect);
     const dist = Math.max(halfW / Math.tan(hFov), (halfH / Math.tan(vFov)) * 1.15) * 1.05;
@@ -690,10 +907,13 @@ export class BinderScene {
       this.raycaster.setFromCamera(this.pointer, this.camera);
       const p = new THREE.Vector3();
       if (this.raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0), 0), p)) {
-        // In front of and above the pointer, like a desk lamp: the foils
-        // still follow the mouse, but the mirror glare goes away from a
-        // camera looking down from above.
-        this.lightTarget.set(p.x - 4, 12, p.z + 14);
+        // Put the light where its mirror reflection off the table, at the
+        // pointer, goes straight into the camera: the card under the mouse
+        // catches it like a card tilted under a lamp, and cards further
+        // away get the softer edge of the reflection.
+        const r = p.clone().sub(this.camera.position).normalize();
+        r.y = -r.y;
+        this.lightTarget.copy(p).addScaledVector(r, 24);
       }
     }
     this.shared.uLight.value.lerp(this.lightTarget, 1 - Math.exp(-dt * 8));
@@ -714,25 +934,31 @@ export class BinderScene {
   private updateHover(dt: number) {
     const hit = this.blockInput || Math.abs(this.pointer.x) > 1 ? null : this.pick();
     this.hovered = hit;
-    let card: THREE.Mesh | null = null;
+    let card: THREE.Object3D | null = null;
     if (hit) {
       const view = [this.left, this.right].find((v) => v?.pageIndex === hit.page);
-      card = view?.cards[hit.slot] ?? null;
+      card = view?.lifts[hit.slot] ?? null;
     }
     const table = hit || this.blockInput || Math.abs(this.pointer.x) > 1 ? null : this.pickTable();
     this.hoveredTable = table?.kind === 'binder' ? table.obj : null;
-    this.canvas.style.cursor = hit || table ? 'pointer' : '';
+    this.canvas.style.cursor = this.turn?.drag
+      ? 'grabbing'
+      : hit || table
+        ? 'pointer'
+        : this.edgeUnderPointer()
+          ? 'grab'
+          : '';
     for (const item of this.tableItems) {
       if (!item) continue;
       const target = BASE_Y + (item === this.hoveredTable ? 0.6 : 0);
       item.position.y += (target - item.position.y) * (1 - Math.exp(-dt * 12));
     }
     for (const view of [this.left, this.right]) {
-      for (const c of view?.cards ?? []) {
+      for (const c of view?.lifts ?? []) {
         if (!c) continue;
         const target = c.userData.restZ + (c === card ? 0.035 : 0);
         c.position.z += (target - c.position.z) * (1 - Math.exp(-dt * 14));
-        c.scale.setScalar(1 + (c.position.z - c.userData.restZ) * 0.6);
+        c.scale.setScalar(c.userData.baseScale * (1 + (c.position.z - c.userData.restZ) * 0.6));
       }
     }
   }

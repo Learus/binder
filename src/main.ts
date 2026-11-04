@@ -1,10 +1,10 @@
 import * as api from './api';
-import { foilLabel, normalizeFoil, RARITIES } from './foils';
+import { foilAges, foilLabel, normalizeFoil, printAge, RARITIES } from './foils';
 import { BinderScene } from './three/binderScene';
 import { TABLE_SLOTS, type TableEntry } from './three/shelf';
 import { InspectView } from './three/inspect';
 import type { SlotHit } from './three/pageView';
-import { SLOTS_PER_PAGE, type Binder, type BinderSummary, type CardRef, type FoilKey, type Game } from './types';
+import { layoutOf, type Binder, type BinderLayout, type BinderSummary, type CardRef, type FoilKey, type Game, type Slot } from './types';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -28,10 +28,16 @@ const ui = {
   prev: $<HTMLButtonElement>('prev'),
   next: $<HTMLButtonElement>('next'),
   pageLabel: $('page-label'),
+  pager: $('pager'),
   inspectPanel: $('inspect-panel'),
   inspectName: $('inspect-name'),
   inspectSet: $('inspect-set'),
   inspectFoil: $<HTMLSelectElement>('inspect-foil'),
+  inspectAgeRow: $('inspect-age-row'),
+  inspectAge: $<HTMLInputElement>('inspect-age'),
+  inspectAgeValue: $('inspect-age-value'),
+  inspectOldRow: $('inspect-old-row'),
+  inspectOld: $<HTMLInputElement>('inspect-old'),
   inspectFlip: $<HTMLButtonElement>('inspect-flip'),
   inspectSelect: $<HTMLButtonElement>('inspect-select'),
   inspectRemove: $<HTMLButtonElement>('inspect-remove'),
@@ -41,6 +47,9 @@ const ui = {
   binderImport: $<HTMLButtonElement>('binder-import'),
   importFile: $<HTMLInputElement>('import-file'),
   closeToggle: $<HTMLButtonElement>('close-toggle'),
+  binderPockets: $<HTMLSelectElement>('binder-pockets'),
+  binderType: $<HTMLSelectElement>('binder-type'),
+  binderStyle: $<HTMLSelectElement>('binder-style'),
 };
 
 const DEFAULT_SHEETS = 10;
@@ -61,7 +70,7 @@ if (!document.createElement('canvas').getContext('webgl2')) {
     '<p style="margin:auto;max-width:520px;padding:24px;line-height:1.6">Card Binder needs WebGL 2 for its 3D view, and this browser or graphics driver doesn\'t provide it. Updating your graphics driver or browser usually fixes this.</p>';
   throw new Error('WebGL 2 unavailable');
 }
-
+(window as any).__dbg = 0;
 const scene = new BinderScene($<HTMLCanvasElement>('view'), {
   onSlotClick,
   onSpreadChange: () => updatePager(),
@@ -74,13 +83,25 @@ inspect.onDismiss = closeInspect;
 
 // ---------- binders ----------
 
-function emptyPages(sheets: number) {
-  return Array.from({ length: sheets * 2 }, () => Array<null>(SLOTS_PER_PAGE).fill(null));
+function emptyPages(sheets: number, pockets: number) {
+  return Array.from({ length: sheets * 2 }, () => Array<null>(pockets).fill(null));
+}
+
+function pocketsOf(b: Binder) {
+  return layoutOf(b).pockets;
 }
 
 function newBinder(name: string): Binder {
   const now = Date.now();
-  return { id: crypto.randomUUID(), name, cover: '#5b2333', createdAt: now, updatedAt: now, pages: emptyPages(DEFAULT_SHEETS) };
+  return {
+    id: crypto.randomUUID(),
+    name,
+    cover: '#5b2333',
+    createdAt: now,
+    updatedAt: now,
+    layout: { pockets: 9, type: 'sleeve', style: 'ring' },
+    pages: emptyPages(DEFAULT_SHEETS, 9),
+  };
 }
 
 let saveTimer = 0;
@@ -107,15 +128,24 @@ function syncSummary(b: Binder) {
   s.cards = countCards(b);
   s.sheets = b.pages.length / 2;
   s.updatedAt = b.updatedAt;
+  s.layout = layoutOf(b);
 }
 
 function summaryOf(b: Binder): BinderSummary {
-  return { id: b.id, name: b.name, updatedAt: b.updatedAt, cards: countCards(b), cover: b.cover, sheets: b.pages.length / 2 };
+  return {
+    id: b.id,
+    name: b.name,
+    updatedAt: b.updatedAt,
+    cards: countCards(b),
+    cover: b.cover,
+    sheets: b.pages.length / 2,
+    layout: layoutOf(b),
+  };
 }
 
 function entryOf(id: string): TableEntry | null {
   const s = summaries.find((x) => x.id === id);
-  return s ? { id: s.id, name: s.name, cover: s.cover, sheets: s.sheets, cards: s.cards } : null;
+  return s ? { id: s.id, name: s.name, cover: s.cover, sheets: s.sheets, cards: s.cards, layout: s.layout } : null;
 }
 
 /** Drop unknown ids, keep the open binder off the table, fill free slots with the rest. */
@@ -196,7 +226,8 @@ function showBinder(b: Binder, closed: boolean) {
     // storage unavailable; we just won't remember the last binder
   }
   renderBinderSelect();
-  ui.binderCover.value = binder.cover;
+  ui.binderCover.value = b.cover;
+  renderLayoutControls();
   updatePager();
   updateStats();
   updateTargetInfo();
@@ -239,7 +270,7 @@ function renderBinderSelect() {
 function updateStats() {
   if (!binder) return;
   const cards = countCards(binder);
-  const pockets = binder.pages.length * SLOTS_PER_PAGE;
+  const pockets = binder.pages.length * pocketsOf(binder);
   ui.binderStats.textContent = `${cards} / ${pockets} cards · ${binder.pages.length} pages`;
   ui.sheetRemove.disabled = binder.pages.length <= 2;
 }
@@ -279,6 +310,53 @@ ui.binderDelete.addEventListener('click', async () => {
   }
 });
 
+// ---------- layout ----------
+
+function renderLayoutControls() {
+  if (!binder) return;
+  const layout = layoutOf(binder);
+  ui.binderPockets.value = String(layout.pockets);
+  ui.binderType.value = layout.type;
+  ui.binderStyle.value = layout.style;
+  ui.binderPockets.disabled = layout.type === 'slab';
+}
+
+/**
+ * Change pockets per page or holder type. Cards keep their order (gaps
+ * included) and flow into the new page size.
+ */
+function setLayout(layout: BinderLayout) {
+  if (!binder || scene.isBusy || scene.isTurning) return renderLayoutControls();
+  const next = layoutOf({ layout });
+  const flat = binder.pages.flat();
+  while (flat.length && !flat[flat.length - 1]) flat.pop();
+  const capacity = Math.max(binder.pages.length * pocketsOf(binder), flat.length);
+  let count = Math.max(2, Math.ceil(capacity / next.pockets));
+  if (count % 2) count++;
+  binder.pages = Array.from({ length: count }, (_, p) =>
+    Array.from({ length: next.pockets }, (_, i) => flat[p * next.pockets + i] ?? null),
+  );
+  binder.layout = next;
+  setSelected(null);
+  scene.setBinder(binder, 0, scene.isClosed);
+  changed();
+  renderLayoutControls();
+}
+
+ui.binderPockets.addEventListener('change', () => {
+  if (binder) setLayout({ ...layoutOf(binder), pockets: Number(ui.binderPockets.value) as BinderLayout['pockets'] });
+});
+ui.binderType.addEventListener('change', () => {
+  if (binder) setLayout({ ...layoutOf(binder), type: ui.binderType.value as BinderLayout['type'] });
+});
+// The style only changes the binder's look, so the pages stay as they are.
+ui.binderStyle.addEventListener('change', () => {
+  if (!binder || scene.isBusy || scene.isTurning) return renderLayoutControls();
+  binder.layout = { ...layoutOf(binder), style: ui.binderStyle.value as BinderLayout['style'] };
+  scene.setBinder(binder, scene.currentSpread, scene.isClosed);
+  changed();
+});
+
 // ---------- import / export ----------
 
 const EXPORT_FORMAT = 'card-binder';
@@ -315,21 +393,28 @@ function parseImport(raw: unknown): Binder {
   const src = (raw as { format?: string; binder?: unknown })?.format === EXPORT_FORMAT ? (raw as { binder: unknown }).binder : raw;
   const b = src as Partial<Binder>;
   if (!b || !Array.isArray(b.pages)) throw new Error('this is not a binder file');
+  const layout = layoutOf(b);
   const games = new Set<Game>(['pokemon', 'mtg', 'ygo']);
   const pages = b.pages.map((page) =>
-    Array.from({ length: SLOTS_PER_PAGE }, (_, i) => {
+    Array.from({ length: layout.pockets }, (_, i) => {
       const slot = Array.isArray(page) ? page[i] : null;
       if (!slot?.card || !games.has(slot.card.game) || typeof slot.card.image !== 'string') return null;
-      return { card: slot.card, foil: normalizeFoil(slot.card.game, String(slot.foil)) };
+      const age = Number(slot.age);
+      return {
+        card: slot.card,
+        foil: normalizeFoil(slot.card.game, String(slot.foil)),
+        ...(slot.age != null && age >= 0 && age <= 1 ? { age } : {}),
+        ...(slot.oldFrame === true && slot.card.game === 'ygo' ? { oldFrame: true } : {}),
+      };
     }),
   );
-  if (pages.length % 2) pages.push(Array(SLOTS_PER_PAGE).fill(null));
-  if (!pages.length) pages.push(...emptyPages(DEFAULT_SHEETS));
+  if (pages.length % 2) pages.push(Array(layout.pockets).fill(null));
+  if (!pages.length) pages.push(...emptyPages(DEFAULT_SHEETS, layout.pockets));
   let name = String(b.name || 'Imported binder');
   if (summaries.some((s) => s.name === name)) name += ' (imported)';
   const now = Date.now();
   const cover = typeof b.cover === 'string' && /^#[0-9a-f]{6}$/i.test(b.cover) ? b.cover : '#5b2333';
-  return { id: crypto.randomUUID(), name, cover, createdAt: now, updatedAt: now, pages };
+  return { id: crypto.randomUUID(), name, cover, createdAt: now, updatedAt: now, layout, pages };
 }
 ui.binderCover.addEventListener('input', () => {
   if (!binder) return;
@@ -338,7 +423,7 @@ ui.binderCover.addEventListener('input', () => {
 });
 ui.sheetAdd.addEventListener('click', () => {
   if (!binder) return;
-  binder.pages.push(...emptyPages(1));
+  binder.pages.push(...emptyPages(1, pocketsOf(binder)));
   changed();
 });
 ui.sheetRemove.addEventListener('click', () => {
@@ -407,14 +492,14 @@ function placeCard(card: CardRef) {
   if (!binder) return;
   let target = findTarget();
   if (!target) {
-    binder.pages.push(...emptyPages(1));
+    binder.pages.push(...emptyPages(1, pocketsOf(binder)));
     target = { page: binder.pages.length - 2, slot: 0 };
   }
   binder.pages[target.page][target.slot] = { card, foil: foilForNew[card.game] };
 
   if (selected) {
     // Walk the selection forward so a row of clicks fills pockets in order.
-    const nextSlot = target.slot + 1 < SLOTS_PER_PAGE ? { page: target.page, slot: target.slot + 1 } : { page: target.page + 1, slot: 0 };
+    const nextSlot = target.slot + 1 < pocketsOf(binder) ? { page: target.page, slot: target.slot + 1 } : { page: target.page + 1, slot: 0 };
     const free = nextSlot.page < binder.pages.length && !binder.pages[nextSlot.page][nextSlot.slot];
     setSelected(free ? nextSlot : null);
   }
@@ -451,8 +536,9 @@ function duplicateCard(hit: SlotHit) {
   if (!binder || !slot) return;
   const page = binder.pages[hit.page];
   let target: SlotHit | null = null;
-  for (let k = 1; k < SLOTS_PER_PAGE && !target; k++) {
-    const i = (hit.slot + k) % SLOTS_PER_PAGE;
+  const pockets = pocketsOf(binder);
+  for (let k = 1; k < pockets && !target; k++) {
+    const i = (hit.slot + k) % pockets;
     if (!page[i]) target = { page: hit.page, slot: i };
   }
   for (let p = hit.page + 1; p < binder.pages.length && !target; p++) {
@@ -460,10 +546,10 @@ function duplicateCard(hit: SlotHit) {
     if (i >= 0) target = { page: p, slot: i };
   }
   if (!target) {
-    binder.pages.push(...emptyPages(1));
+    binder.pages.push(...emptyPages(1, pockets));
     target = { page: binder.pages.length - 2, slot: 0 };
   }
-  binder.pages[target.page][target.slot] = { card: slot.card, foil: slot.foil };
+  binder.pages[target.page][target.slot] = { ...slot };
   changed();
   toast(`Copied ${slot.card.name} to page ${target.page + 1}, pocket ${target.slot + 1}`);
   const spread = spreadOfPage(target.page);
@@ -482,6 +568,50 @@ ui.closeToggle.addEventListener('click', () => void toggleClosed());
 ui.prev.addEventListener('click', () => scene.turnPage(-1));
 ui.next.addEventListener('click', () => scene.turnPage(1));
 
+// The arrows sit beside the binder and the pager under it, following the camera.
+scene.addOverlay(() => {
+  const shown = inspect.isOpen ? 'hidden' : '';
+  for (const el of [ui.prev, ui.next, ui.pager]) el.style.visibility = shown;
+  const b = scene.screenBounds();
+  const stage = ui.pager.parentElement!;
+  const [w, h] = [stage.clientWidth, stage.clientHeight];
+  const pw = ui.pager.offsetWidth;
+  const ph = ui.pager.offsetHeight;
+  const gap = 14;
+  const size = 44;
+  const clamp = (v: number, lo: number, hi: number) => Math.round(Math.min(Math.max(v, lo), hi));
+  const left = b ? [b.left.x - gap - size, b.left.y - size / 2] : [8, h / 2 - size / 2];
+  const right = b ? [b.right.x + gap, b.right.y - size / 2] : [w - 8 - size, h / 2 - size / 2];
+  const below = b ? [b.bottom.x - pw / 2, b.bottom.y + gap] : [w / 2 - pw / 2, h - 16 - ph];
+  ui.prev.style.transform = `translate(${clamp(left[0], 8, w - 8 - size)}px, ${clamp(left[1], 8, h - 8 - size)}px)`;
+  ui.next.style.transform = `translate(${clamp(right[0], 8, w - 8 - size)}px, ${clamp(right[1], 8, h - 8 - size)}px)`;
+  ui.pager.style.transform = `translate(${clamp(below[0], 8, w - 8 - pw)}px, ${clamp(below[1], 8, h - 16 - ph)}px)`;
+});
+
+// Typing a page number turns to it; digits typed close together make one number.
+let pageTyped = '';
+let pageTimer = 0;
+function typePageDigit(d: string) {
+  pageTyped = (pageTyped + d).slice(-4);
+  ui.pageLabel.textContent = `Go to page ${pageTyped}…`;
+  clearTimeout(pageTimer);
+  // Wait for another digit only if one could still make a page number.
+  if (Number(pageTyped) * 10 > (binder?.pages.length ?? 0)) goToTypedPage();
+  else pageTimer = window.setTimeout(goToTypedPage, 700);
+}
+function goToTypedPage() {
+  clearTimeout(pageTimer);
+  const n = Number(pageTyped);
+  pageTyped = '';
+  updatePager();
+  const total = binder?.pages.length ?? 0;
+  if (!n || n > total) {
+    toast(`There is no page ${n} (${total} pages)`);
+    return;
+  }
+  scene.turnTo(spreadOfPage(n - 1));
+}
+
 // ---------- inspect ----------
 
 function fillFoilSelect(sel: HTMLSelectElement, g: Game, value: FoilKey) {
@@ -498,12 +628,13 @@ function openInspect(hit: SlotHit) {
   const slot = binder?.pages[hit.page][hit.slot];
   if (!slot) return;
   inspecting = hit;
-  inspect.show(slot);
+  inspect.show(slot, layoutOf(binder).type === 'slab');
   ui.inspectName.textContent = slot.card.name;
   ui.inspectSet.textContent = [slot.card.set, slot.card.number && `#${slot.card.number}`, `page ${hit.page + 1}`]
     .filter(Boolean)
     .join(' · ');
   fillFoilSelect(ui.inspectFoil, slot.card.game, slot.foil);
+  showAge(slot);
   ui.inspectPanel.hidden = false;
 }
 
@@ -518,7 +649,43 @@ ui.inspectFoil.addEventListener('change', () => {
   const slot = inspecting && binder?.pages[inspecting.page][inspecting.slot];
   if (!slot) return;
   slot.foil = ui.inspectFoil.value as FoilKey;
-  inspect.setFoil(slot.foil);
+  delete slot.age;
+  inspect.setFoil(slot.foil, slot);
+  showAge(slot);
+  changed();
+});
+
+function showAge(slot: Slot) {
+  ui.inspectAgeRow.hidden = !foilAges(slot.card.game, slot.foil);
+  const age = printAge(slot.card.game, slot.foil, slot.age);
+  ui.inspectAge.value = String(age);
+  ui.inspectAgeValue.textContent = ageLabel(age);
+  ui.inspectOldRow.hidden = slot.card.game !== 'ygo';
+  ui.inspectOld.checked = Boolean(slot.oldFrame);
+}
+
+function ageLabel(age: number) {
+  return age === 0 ? 'new' : age < 0.5 ? 'worn' : age < 0.9 ? 'old' : 'vintage';
+}
+
+// Dragging updates the close-up live; the binder page rebuilds on release.
+ui.inspectAge.addEventListener('input', () => {
+  const slot = inspecting && binder?.pages[inspecting.page][inspecting.slot];
+  if (!slot) return;
+  const age = Number(ui.inspectAge.value);
+  // Only a moved slider is saved, so cards follow the rarity's default otherwise.
+  if (age === printAge(slot.card.game, slot.foil)) delete slot.age;
+  else slot.age = age;
+  ui.inspectAgeValue.textContent = ageLabel(age);
+  inspect.setFoil(slot.foil, slot);
+});
+ui.inspectAge.addEventListener('change', () => changed());
+ui.inspectOld.addEventListener('change', () => {
+  const slot = inspecting && binder?.pages[inspecting.page][inspecting.slot];
+  if (!slot) return;
+  if (ui.inspectOld.checked) slot.oldFrame = true;
+  else delete slot.oldFrame;
+  inspect.setFoil(slot.foil, slot);
   changed();
 });
 ui.inspectFlip.addEventListener('click', () => inspect.flip());
@@ -605,7 +772,11 @@ ui.foilSelect.addEventListener('change', () => {
 window.addEventListener('keydown', (e) => {
   const typing = e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement;
   if (e.key === 'Escape') {
-    if (inspecting) closeInspect();
+    if (pageTyped) {
+      pageTyped = '';
+      clearTimeout(pageTimer);
+      updatePager();
+    } else if (inspecting) closeInspect();
     else setSelected(null);
     return;
   }
@@ -621,7 +792,9 @@ window.addEventListener('keydown', (e) => {
     if (e.key === 'f' || e.key === 'F') inspect.flip();
     return;
   }
-  if (e.key === 'ArrowRight') scene.turnPage(1);
+  if (/^[0-9]$/.test(e.key) && !e.ctrlKey && !e.metaKey && !e.altKey && !scene.isClosed) typePageDigit(e.key);
+  else if (e.key === 'Enter' && pageTyped) goToTypedPage();
+  else if (e.key === 'ArrowRight') scene.turnPage(1);
   else if (e.key === 'ArrowLeft') scene.turnPage(-1);
   else if (e.key === 'r' || e.key === 'R') scene.resetView();
   else if (e.key === 't' || e.key === 'T') scene.tableView();
