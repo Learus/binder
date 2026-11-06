@@ -10,6 +10,12 @@ export interface CardRef {
   image: string;
   large: string;
   back?: string;
+  /** Short rarity code of this printing, e.g. UR or SIR, when the source says. */
+  rarity?: string;
+  /** Yu-Gi-Oh! card type, e.g. Effect Monster. Older saved cards keep it in \`set\`. */
+  kind?: string;
+  /** Release date (YYYY-MM-DD) of the set this printing is from, when known. */
+  released?: string;
 }
 
 export type FoilKey =
@@ -41,10 +47,24 @@ export interface Slot {
   age?: number;
   /** Yu-Gi-Oh! only: the early frame with a shorter art window. */
   oldFrame?: boolean;
+  /** Wear and damage. Missing means mint. */
+  condition?: Condition;
 }
 
-/** How a card is printed, apart from its rarity. */
-export type PrintLook = Pick<Slot, 'age' | 'oldFrame'>;
+/** Card wear, each 0 (none) to 1 (as bad as it gets). */
+export interface Condition {
+  /** Folds and corner bends. */
+  crease: number;
+  /** Whitening and chipping along the edges, worst at the corners. */
+  edges: number;
+  /** Scuffs and scratches on the surface. */
+  scratches: number;
+  /** Sun fading, yellowing and grime. */
+  fade: number;
+}
+
+/** How a card is printed and kept, apart from its rarity. */
+export type PrintLook = Pick<Slot, 'age' | 'oldFrame' | 'condition'> & { card?: CardRef };
 
 export type BinderType = 'sleeve' | 'slab';
 export type PocketCount = 4 | 9 | 16;

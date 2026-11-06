@@ -150,7 +150,7 @@ label.inline select {
   min-height: 0;
   overflow-y: auto;
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
   align-content: start;
   padding-right: 2px;
@@ -175,7 +175,65 @@ label.inline select {
   display: block;
 }
 
+.search-box {
+  position: relative;
+  flex: 1;
+  display: flex;
+}
+
+.search-box input {
+  flex: 1;
+  min-width: 0;
+  padding-right: 34px;
+}
+
+.word-toggle {
+  position: absolute;
+  right: 3px;
+  top: 50%;
+  transform: translateY(-50%);
+  padding: 1px 5px;
+  font-size: 12px;
+  line-height: 18px;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  color: var(--muted);
+  background: none;
+  border-color: transparent;
+}
+
+.word-toggle[aria-pressed='true'] {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.filters select,
+.filters input {
+  flex: 1;
+  min-width: 0;
+}
+
+.result {
+  position: relative;
+  min-width: 0;
+}
+
+.result .rarity {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  padding: 1px 4px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  color: #fff;
+  background: rgba(10, 12, 16, 0.78);
+  pointer-events: none;
+}
+
 .result span {
+  display: block;
+  max-width: 100%;
   font-size: 11px;
   color: var(--muted);
   white-space: nowrap;
@@ -291,6 +349,8 @@ label.inline select {
   top: 50%;
   transform: translateY(-50%);
   width: 250px;
+  max-height: calc(100% - 32px);
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -330,6 +390,107 @@ label.inline select {
   accent-color: #c9a45a;
 }
 
+#inspect-condition {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.grades {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+}
+
+.grades button {
+  padding: 4px 0;
+  font-size: 12px;
+}
+
+.grades button[aria-pressed='true'] {
+  background: #c9a45a;
+  border-color: #c9a45a;
+  color: #16181e;
+}
+
+.wear {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 2px 8px;
+}
+
+.wear input {
+  width: 100%;
+  accent-color: #c9a45a;
+}
+
+.prices {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.prices h4 {
+  margin: 4px 0 0;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.prices table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.prices th,
+.prices td {
+  padding: 1px 0;
+  text-align: right;
+  font-weight: normal;
+}
+
+.prices th:first-child,
+.prices td:first-child {
+  text-align: left;
+}
+
+.prices th {
+  color: var(--muted, #8a8f9c);
+  font-size: 11px;
+}
+
+.prices a {
+  color: inherit;
+}
+
+.market {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.market img {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+}
+
+.market-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  margin-top: 4px;
+}
+
+#inspect-panel .card-nav {
+  flex-wrap: nowrap;
+  align-items: center;
+  justify-content: space-between;
+}
+
 #inspect-name {
   font-size: 16px;
   font-weight: 600;
@@ -353,4 +514,44 @@ label.inline select {
     bottom: 60px;
     transform: none;
   }
+}
+
+/* The card following the pointer while it's dragged to a pocket. */
+.drag-ghost {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 50;
+  pointer-events: none;
+  will-change: transform;
+}
+
+.drag-ghost img {
+  display: block;
+  width: 84px;
+  border-radius: 4px;
+  transform: translate(-50%, -50%) rotate(-4deg);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.55);
+  opacity: 0.92;
+}
+
+.drag-ghost.copy::after {
+  content: '+';
+  position: absolute;
+  left: 30px;
+  top: -62px;
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  background: var(--accent, #e8b94a);
+  color: #111;
+  font-weight: 700;
+  text-align: center;
+  line-height: 22px;
+}
+
+body.dragging-card,
+body.dragging-card * {
+  cursor: grabbing !important;
+  user-select: none;
 }

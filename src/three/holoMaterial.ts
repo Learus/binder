@@ -1,5 +1,7 @@
 import * as THREE from 'three';
-import { ART_BOX, CARD_SIZE, NAME_BOX, printAge, rarityOf, YGO_FRAME } from '../foils';
+import { ART_BOX, CARD_SIZE, hasOldFrame, NAME_BOX, printAge, rarityOf, YGO_FRAME } from '../foils';
+import { conditionOf, wearSeed } from '../condition';
+import stickerUrl from '../assets/ygo-sticker.png';
 import type { PrintLook } from '../types';
 import type { FoilKey, Game } from '../types';
 
@@ -78,7 +80,20 @@ uniform float uEmbossStars;
 uniform float uShinyIcons;
 uniform float uDepth;
 uniform float uBgOnly;
-uniform float uOldFrame;      // Yu-Gi-Oh! early frame: shorter art window
+uniform float uOldFrame;      // Yu-Gi-Oh! early frame: smaller art box
+
+// Condition, each 0 (mint) to 1.
+uniform float uCrease;
+uniform float uEdgeWear;
+uniform float uScratch;
+uniform float uFade;
+uniform float uSeed;          // 0..1 per card, so each copy wears in its own places
+uniform float uMirror;        // 1 on a card's back, so its wear lines up with the front
+
+// Yu-Gi-Oh! authenticity hologram in the bottom-right corner.
+uniform sampler2D uStickerTex; // grey pattern: bright = raised
+uniform float uSticker;
+uniform vec4 uStickerBox;
 
 // Frame parts (Yu-Gi-Oh!), same convention as uArt.
 uniform vec4 uInner;          // inside edge of the outer border
@@ -132,6 +147,91 @@ float noise(vec2 p) {
              mix(latticeHash(i + ivec2(0, 1)), latticeHash(i + ivec2(1, 1)), u.x), u.y);
 }
 
+// Signed distance to the card's rounded outline, in card heights (< 0 inside).
+float cardDist(vec2 q, vec2 half_) {
+  vec2 e = abs(q) - half_ + uRadius;
+  return length(max(e, 0.0)) + min(max(e.x, e.y), 0.0) - uRadius;
+}
+
+// How worn the edge is here: patchy along the sides, worst at the corners.
+float edgeAmount(vec2 q, vec2 half_, float s) {
+  float corner = clamp(1.0 - length(half_ - abs(q)) / 0.14, 0.0, 1.0);
+  float patchy = noise(q * 18.0 + s * 97.0);
+  return uEdgeWear * (0.15 + 0.85 * patchy * patchy + 1.3 * corner * corner);
+}
+
+// Folds: up to four, a corner bend first. p is in card space (x scaled by
+// the aspect). Returns the surface tilt; white is the cracked ink along the
+// fold lines.
+vec2 creases(vec2 p, float s, float px, out float white) {
+  vec2 tilt = vec2(0.0);
+  white = 0.0;
+  for (int i = 0; i < 4; i++) {
+    float k = clamp(uCrease * 4.0 - float(i), 0.0, 1.0);
+    if (k <= 0.0) break;
+    float fi = float(i);
+    vec3 h = vec3(hash(vec2(s * 91.0, fi + 1.3)), hash(vec2(fi + 4.1, s * 37.0)), hash(vec2(s * 13.0 + fi, 8.7)));
+    vec2 n;
+    float d;
+    if (i == 0 || i == 2) {
+      // A short fold across one corner.
+      float c = floor(h.x * 4.0);
+      float right = mod(c, 2.0);
+      float top = floor(c / 2.0);
+      vec2 corner = vec2(right * uAspect, top);
+      float a = atan(1.0 - 2.0 * top, 1.0 - 2.0 * right) + (h.y - 0.5) * 0.7;
+      n = vec2(cos(a), sin(a));
+      d = dot(p - corner, n) - (0.05 + 0.1 * h.z);
+    } else {
+      // A fold right across the card.
+      float a = h.z * 3.14159;
+      n = vec2(cos(a), sin(a));
+      d = dot(p - vec2(uAspect * (0.2 + 0.6 * h.x), 0.2 + 0.6 * h.y), n);
+    }
+    float t = dot(p, vec2(-n.y, n.x));
+    d += (noise(vec2(t * 25.0, fi * 17.0 + s * 50.0)) - 0.5) * 0.008;
+    float amp = k * (0.5 + 0.5 * uCrease);
+    float w = 0.005;
+    float g = exp(-d * d / (w * w));
+    tilt += n * (d / w) * g * 0.9 * amp;                         // the ridge
+    tilt += n * clamp(d / 0.04, -1.0, 1.0) * 0.035 * amp;       // the halves sit at different angles
+    float lw = max(0.0012, px * 0.8);
+    float crack = exp(-d * d / (lw * lw)) * (0.0012 / lw);
+    white = max(white, crack * (0.35 + 0.65 * noise(vec2(t * 180.0, fi * 5.0 + s * 20.0))) * amp);
+  }
+  return tilt;
+}
+
+// Scuffs: short straight scratches scattered over a grid, in two sizes, most
+// of them running roughly one way (from shuffling).
+float scratches(vec2 p, float s, float px) {
+  float m = 0.0;
+  float heading = hash(vec2(s * 17.0, 2.9)) * 3.14159;
+  for (int layer = 0; layer < 2; layer++) {
+    float scale = layer == 0 ? 9.0 : 26.0;
+    float density = uScratch * (layer == 0 ? 0.3 : 0.35);
+    vec2 g = p * scale + s * 40.0 + float(layer) * 7.3;
+    vec2 id = floor(g);
+    float wd = max(0.0016, px) * scale;       // line width, in cells
+    float fade = 0.0016 * scale / wd;
+    for (int j = 0; j < 9; j++) {
+      vec2 c = id + vec2(float(j % 3) - 1.0, float(j / 3) - 1.0);
+      if (hash(c + 3.7) > density) continue;
+      vec2 a = c + hash2(c);
+      float r = hash(c + 9.1);
+      float ang = r < 0.6 ? heading + (r - 0.3) * 0.8 : r * 3.14159 * 1.6;
+      vec2 dir = vec2(cos(ang), sin(ang));
+      float half_ = 0.15 + 0.55 * hash(c + 5.5);
+      vec2 rel = g - a;
+      float t = clamp(dot(rel, dir), -half_, half_);
+      float dd = length(rel - dir * t);
+      float taper = 1.0 - pow(abs(t) / half_, 4.0);
+      m = max(m, smoothstep(wd, 0.0, dd) * taper * fade * (0.4 + 0.6 * hash(c + 1.1)));
+    }
+  }
+  return m;
+}
+
 // How strongly a tiny mirror tilted by \`tilt\` reflects the light into the eye.
 float flake(vec3 N, vec3 T, vec3 B, vec2 tilt, vec3 V, vec3 L, float sharp) {
   vec3 n = normalize(N + T * tilt.x + B * tilt.y);
@@ -166,24 +266,91 @@ float liquidBright(vec3 N, vec3 V, vec3 L) {
   return 0.1 + 0.35 * bands + 0.8 * pow(r, 8.0) + 1.8 * pow(r, 90.0);
 }
 
-// Early Yu-Gi-Oh! frame: a smaller art window. For now only narrower: the
-// bevelled art frame moves in from both sides by OLD_INSET, the card
-// background beside it widens to fill the gap, and the art is cropped at its
-// sides (not squeezed). Returns where to read the modern card image instead.
-const float OLD_INSET = 0.03;
-vec2 oldFrameUv(vec2 uv) {
-  if (uv.y < uArtFrame.y || uv.y > uArtFrame.w) return uv;
-  // Mirror the right half onto the left, map, then mirror back.
-  bool right = uv.x > 0.5;
-  float x = right ? 1.0 - uv.x : uv.x;
+// Early Yu-Gi-Oh! frame: a smaller art window. The bevelled art frame and the
+// art inside it scale down together (nothing is cropped or squashed), about a
+// point a little above the frame's centre so the gap above it stays small.
+// The gap between the old frame and the scaled one gets the card background
+// beside the old frame: mirrored across its side edges, and above and below
+// from the thin strips under the level stars and over the text box, mirrored
+// at its edge and stretched a little. The corners blend the two.
+// The art frame casts a soft shadow that fades over about 0.012 of the card,
+// so every pixel read from near the old frame has that shadow taken out and
+// the scaled frame's shadow put in, at its own distance from each frame.
+// Without that, the gaps would carry stretched shadow and the old frame's
+// shadow would be left behind as a dark line around the new one.
+// Measured on modern cards in top-down coordinates: the art frame including
+// the darkest of its shadow, how much background lies above and below it,
+// and the frame's outline, from which the shadow fades.
+const vec4 OLD_FRAME = vec4(0.097, 0.168, 0.903, 0.723);
+const vec4 OLD_OUTLINE = vec4(0.1033, 0.1722, 0.8979, 0.7139);
+const float OLD_TOP_BAND = 0.0045;
+const float OLD_BOTTOM_BAND = 0.009;
+const float OLD_SCALE = 0.96;
+const float OLD_ANCHOR = 0.35; // scale centre, from the frame's top down
+
+// How much light the art frame's shadow leaves at p (top-down), from the
+// frame outline r. It fades as exp(-(distance / reach)^1.7). The light comes
+// from the upper left, so it is darkest below and right of the frame and
+// lightest above it (fitted to scanned cards); past a corner the strength
+// and reach blend between the two edges.
+float frameShadow(vec2 p, vec4 r) {
+  vec2 d = max(max(r.xy - p, p - r.zw), 0.0);
+  d.x *= uAspect;
+  float len = length(d);
+  float wy = len > 0.0 ? d.y * d.y / (len * len) : 0.0;
+  vec2 tb = p.y < r.y ? vec2(0.394, 0.0055) : vec2(0.571, 0.0051); // strength, reach
+  vec2 lr = p.x < r.x ? vec2(0.52, 0.0062) : vec2(0.6, 0.007);
+  vec2 k = mix(lr, tb, wy);
+  return 1.0 - k.x * exp(-pow(len / k.y, 1.7));
+}
+
+// Returns where to read the card (colour, foil map and frame masks), and
+// light, what to multiply the colour by; in the corners src2, light2 and w2
+// give a second colour to blend in. outside is 1 outside the scaled frame,
+// where the art frame's own effects (such as the ultimate's embossed trim)
+// no longer belong, though the art frame's box from the masks reaches there.
+vec2 oldFrameUv(vec2 uv, out float light, out vec2 src2, out float light2, out float w2, out float outside) {
+  src2 = uv;
+  light = 1.0;
+  light2 = 1.0;
+  w2 = 0.0;
+  outside = 0.0;
+  vec4 o = OLD_FRAME;
   float inner = uInner.x;
-  float frame = uArtFrame.x;
-  float art = uArt.x;
-  if (x < inner) return uv;
-  float src = x;
-  if (x < frame + OLD_INSET) src = inner + (x - inner) * (frame - inner) / (frame + OLD_INSET - inner);
-  else if (x < art + OLD_INSET) src = x - OLD_INSET;
-  return vec2(right ? 1.0 - src : src, uv.y);
+  vec2 p = vec2(uv.x, 1.0 - uv.y);
+  if (p.x < inner || p.x > 1.0 - inner) return uv;
+  vec2 c = vec2(0.5, mix(o.y, o.w, OLD_ANCHOR));
+  vec4 f = vec4(c + (o.xy - c) * OLD_SCALE, c + (o.zw - c) * OLD_SCALE);
+  if (p.x >= f.x && p.x <= f.z && p.y >= f.y && p.y <= f.w) {
+    vec2 q = c + (p - c) / OLD_SCALE;
+    return vec2(q.x, 1.0 - q.y);
+  }
+  outside = 1.0;
+  vec4 r = OLD_OUTLINE;
+  vec4 rs = vec4(c + (r.xy - c) * OLD_SCALE, c + (r.zw - c) * OLD_SCALE);
+  float there = frameShadow(p, rs);
+  if (p.x < o.x || p.x > o.z || p.y < o.y || p.y > o.w) {
+    // Outside the old frame the card stays as printed, with the shadow moved.
+    light = there / frameShadow(p, r);
+    return uv;
+  }
+  vec2 side = vec2(p.x < 0.5 ? 2.0 * o.x - p.x : 2.0 * o.z - p.x, p.y);
+  bool top = p.y < f.y;
+  vec2 s = side;
+  if (top || p.y > f.w) {
+    float depth = top ? (p.y - o.y) / (f.y - o.y) : (o.w - p.y) / (o.w - f.w);
+    s = vec2(p.x, top ? o.y - depth * OLD_TOP_BAND : o.w + depth * OLD_BOTTOM_BAND);
+    float xm = min(p.x, 1.0 - p.x);
+    if (xm < f.x) {
+      // Corner: lean towards the edge of the old frame it is nearer.
+      float toSide = (xm - o.x) / (f.x - o.x);
+      w2 = smoothstep(-0.25, 0.25, depth - toSide);
+      src2 = vec2(side.x, 1.0 - side.y);
+      light2 = there / frameShadow(side, r);
+    }
+  }
+  light = there / frameShadow(s, r);
+  return vec2(s.x, 1.0 - s.y);
 }
 
 // Gradient of one foil-map channel, in texels.
@@ -203,10 +370,41 @@ void main() {
   vec2 q = (vUv - 0.5) * vec2(uAspect, 1.0);
   if (length(max(abs(q) - half_ + uRadius, 0.0)) - uRadius > 0.0) discard;
 
-  // Where the printed card is read from (differs only for the old frame).
-  vec2 uv = uOldFrame > 0.5 ? oldFrameUv(vUv) : vUv;
+  // Wear is laid out in its own space, mirrored on the back so both sides
+  // of the card wear in the same places.
+  vec2 wuv = uMirror > 0.5 ? vec2(1.0 - vUv.x, vUv.y) : vUv;
+  vec2 wq = (wuv - 0.5) * vec2(uAspect, 1.0);
+  vec2 wcp = vec2(wuv.x * uAspect, wuv.y);
+  float depthIn = -cardDist(wq, half_);
+  float px = fwidth(vUv.y);   // one screen pixel, in card heights
+  float edgeWhite = 0.0;
+  if (uEdgeWear > 0.0) {
+    float amt = edgeAmount(wq, half_, uSeed);
+    // Bits of the edge gone, mostly at the corners.
+    float chip = amt * amt * 0.0035 * smoothstep(0.45, 0.85, noise(wq * 70.0 + uSeed * 53.0));
+    if (depthIn < chip) discard;
+    float fine = mix(noise(wq * 260.0 + uSeed * 31.0), 0.5, clamp(px * 150.0 - 0.5, 0.0, 1.0));
+    float reach = amt * (0.002 + 0.005 * fine);
+    // As much of this pixel as lies in the worn strip, so faint wear stays faint from afar.
+    edgeWhite = clamp((reach - depthIn) / max(px, 0.4 * reach), 0.0, 1.0);
+    // Specks of white just inside the worn line.
+    float speck = step(0.78, noise(wq * 520.0 + uSeed * 7.0)) * (1.0 - smoothstep(reach, reach * 2.5 + px, depthIn));
+    edgeWhite = max(edgeWhite, speck * min(amt, 1.0) * (1.0 - clamp(px * 300.0 - 1.0, 0.0, 1.0)));
+  }
+  float creaseWhite = 0.0;
+  vec2 creaseTilt = uCrease > 0.0 ? creases(wcp, uSeed, px, creaseWhite) : vec2(0.0);
+  creaseTilt.x *= uMirror > 0.5 ? -1.0 : 1.0;   // back to the card's own uv directions
 
-  vec3 base = uHasMap > 0.5 ? texture2D(uMap, uv).rgb : vec3(0.08, 0.085, 0.1);
+  // Where the printed card is read from (differs only for the old frame).
+  vec2 src2 = vUv;
+  float light = 1.0;
+  float light2 = 1.0;
+  float w2 = 0.0;
+  float outsideArt = 0.0;
+  vec2 uv = uOldFrame > 0.5 ? oldFrameUv(vUv, light, src2, light2, w2, outsideArt) : vUv;
+
+  vec3 base = uHasMap > 0.5 ? texture2D(uMap, uv).rgb * light : vec3(0.08, 0.085, 0.1);
+  if (w2 > 0.0 && uHasMap > 0.5) base = mix(base, texture2D(uMap, src2).rgb * light2, w2);
   bool hasFm = uHasFoilMap > 0.5;
   vec4 fm = hasFm ? texture2D(uFoilMap, uv) : vec4(0.0);
 
@@ -217,10 +415,23 @@ void main() {
   vec3 V = normalize(cameraPosition - vWorldPos);
   vec3 L = normalize(uLight - vWorldPos);
   vec2 Lt = vec2(dot(L, T), dot(L, B));
+  N = normalize(N + T * creaseTilt.x + B * creaseTilt.y);
+
+  // Faded ink: washed-out colours, lifted blacks, yellowed whites, and grime
+  // in patches and along the handled edges.
+  if (uFade > 0.0) {
+    float l = dot(base, vec3(0.2126, 0.7152, 0.0722));
+    base = mix(base, vec3(l), 0.5 * uFade);
+    base = mix(base, base * vec3(1.0, 0.95, 0.8) + vec3(0.09, 0.075, 0.04), uFade);
+    float grime = smoothstep(0.45, 0.95, noise(wcp * 5.0 + uSeed * 23.0)) + 0.6 * (1.0 - smoothstep(0.0, 0.05, depthIn));
+    base *= 1.0 - uFade * 0.22 * grime;
+  }
+  // Folds catch and lose the light on either side.
+  base *= clamp(1.0 + dot(creaseTilt, Lt) * 1.5, 0.6, 1.4);
 
   float inArt = inRect(uArt, uv);
   float region = uRegion == 1 ? inArt : uRegion == 2 ? 1.0 - inArt : uRegion == 3 ? 1.0 : 0.0;
-  float trimMask = max(1.0 - inRect(uInner, uv), inRect(uArtFrame, uv) * (1.0 - inArt));
+  float trimMask = max(1.0 - inRect(uInner, uv), inRect(uArtFrame, uv) * (1.0 - inArt) * (1.0 - outsideArt));
   float letters = inRect(uNameBox, uv) * fm.r;
   float stars = inRect(uStarsBox, uv) * fm.r;
   float border = 1.0 - inRect(uInner, uv);
@@ -511,10 +722,63 @@ void main() {
   float gloss = 0.2 * (1.0 - uRough) * (uPattern == 8 ? 0.3 : 1.0);
   col += vec3(pow(max(dot(reflect(-V, Ng), L), 0.0), 160.0)) * gloss;
 
+  // The hologram sticker: gold foil pressed with a pattern, throwing a
+  // rainbow as it tilts.
+  if (uSticker > 0.5) {
+    vec2 sp = (uv - uStickerBox.xy) / (uStickerBox.zw - uStickerBox.xy);
+    vec2 sq = abs(sp - 0.5) * 2.0;
+    float edge = max(sq.x, sq.y);
+    if (edge < 1.0) {
+      vec2 st = vec2(1.0 / 128.0);
+      float pat = textureLod(uStickerTex, sp, 0.0).r;
+      vec2 sg = vec2(textureLod(uStickerTex, sp + vec2(st.x, 0.0), 0.0).r - textureLod(uStickerTex, sp - vec2(st.x, 0.0), 0.0).r,
+                     textureLod(uStickerTex, sp + vec2(0.0, st.y), 0.0).r - textureLod(uStickerTex, sp - vec2(0.0, st.y), 0.0).r);
+      pat = smoothstep(0.1, 0.95, pat);
+      vec3 Ns = normalize(N + T * sg.x * 3.0 + B * sg.y * 3.0);
+      float rs = max(dot(reflect(-V, Ns), L), 0.0);
+      float sh = dot(V + L, T) * 1.6 + dot(V + L, B) * 0.8 + pat * 0.6;
+      vec3 gold = vec3(0.95, 0.7, 0.3);
+      // Gold foil with the pattern pressed in: raised parts catch more light.
+      vec3 sc = gold * (0.3 + 0.4 * pat) * (0.55 + 0.9 * pow(rs, 4.0));
+      sc += gold * spectrum(sh) * 0.35 * (0.3 + 0.7 * pow(rs, 2.0)) * (0.5 + 0.5 * pat);
+      sc += vec3(1.0, 0.92, 0.7) * pow(rs, 60.0) * 0.4;
+      // A thin bright rim and soft corners.
+      float corner = length(max(sq - 0.8, 0.0)) / 0.2;
+      sc *= 1.0 + 0.5 * smoothstep(0.86, 0.95, edge);
+      float a = 1.0 - smoothstep(0.96, 1.0, max(edge, corner));
+      col = mix(col, sc, a);
+    }
+  }
+
+  // Scratches scatter light and cut through the foil; wide scuffed patches
+  // dull the gloss.
+  if (uScratch > 0.0) {
+    float spec = pow(max(dot(reflect(-V, N), L), 0.0), 6.0);
+    float sc = scratches(wcp, uSeed + uMirror * 0.37, px) * (0.5 + 0.5 * uScratch);
+    col = mix(col, printed * 0.85 + vec3(0.06 + 0.4 * spec), sc * 0.5);
+    float haze = uScratch * smoothstep(0.35, 0.8, noise(wcp * 4.0 + uSeed * 11.0));
+    col = mix(col, col * 0.88 + vec3(0.05 + 0.12 * spec), haze * 0.45);
+  }
+  col = mix(col, col * vec3(1.0, 0.96, 0.88), 0.35 * uFade);
+  // Card stock showing through worn edges and cracked folds.
+  col = mix(col, vec3(0.92, 0.91, 0.87), clamp(max(edgeWhite, creaseWhite), 0.0, 1.0));
+
   gl_FragColor = vec4(col, 1.0);
   #include <colorspace_fragment>
 }
 `;
+
+/** Where the hologram sits: [left, top, right, bottom] from the top-left. */
+const YGO_STICKER: [number, number, number, number] = [0.913, 0.94, 0.964, 0.975];
+
+let sticker: THREE.Texture | null = null;
+function stickerTexture() {
+  if (!sticker) {
+    sticker = new THREE.TextureLoader().load(stickerUrl);
+    sticker.colorSpace = THREE.NoColorSpace;
+  }
+  return sticker;
+}
 
 /** [left, top, right, bottom] from the top-left, to a uv rect from the bottom-left. */
 const rect = ([l, t, r, b]: [number, number, number, number]) => new THREE.Vector4(l, 1 - b, r, 1 - t);
@@ -562,6 +826,15 @@ export function createCardMaterial(
       uTrim: { value: 0 },
       uDim: { value: 0 },
       uOldFrame: { value: 0 },
+      uCrease: { value: 0 },
+      uEdgeWear: { value: 0 },
+      uScratch: { value: 0 },
+      uFade: { value: 0 },
+      uSeed: { value: 0 },
+      uMirror: { value: 0 },
+      uStickerTex: { value: stickerTexture() },
+      uSticker: { value: 0 },
+      uStickerBox: { value: rect(YGO_STICKER) },
       uAge: { value: 0 },
       uEmbossStars: { value: 0 },
       uShinyIcons: { value: 0 },
@@ -603,9 +876,23 @@ export function setCardFoil(mat: THREE.ShaderMaterial, game: Game, foil: FoilKey
   u.uTrim.value = p.trim;
   u.uDim.value = p.dim;
   u.uAge.value = printAge(game, foil, look.age);
-  u.uOldFrame.value = game === 'ygo' && look.oldFrame ? 1 : 0;
+  u.uOldFrame.value = look.card && look.oldFrame && hasOldFrame(look.card) ? 1 : 0;
   u.uEmbossStars.value = p.embossStars ? 1 : 0;
   u.uShinyIcons.value = p.shinyIcons ? 1 : 0;
   u.uDepth.value = p.depth;
   u.uBgOnly.value = p.backgroundOnly;
+  u.uSticker.value = game === 'ygo' && look.card ? 1 : 0;
+  setCardWear(mat, look);
+}
+
+/** Wear and damage; `back` lays it out to match the front from behind. */
+export function setCardWear(mat: THREE.ShaderMaterial, look: PrintLook = {}, back = false) {
+  const c = conditionOf(look.condition);
+  const u = mat.uniforms;
+  u.uCrease.value = c.crease;
+  u.uEdgeWear.value = c.edges;
+  u.uScratch.value = c.scratches;
+  u.uFade.value = c.fade;
+  u.uSeed.value = wearSeed(look.card);
+  u.uMirror.value = back ? 1 : 0;
 }

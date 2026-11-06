@@ -35,7 +35,7 @@ export function makeFoilMap(image: HTMLImageElement | ImageBitmap, game: Game, m
     stamp = boxMask(px, w, h, NAME_BOX[game], 0.16, true);
     // A row of 12 stars has no free background, so compare against the
     // frame beside the art instead.
-    const side: [number, number, number, number] = [YGO_FRAME.inner[0] + 0.01, 0.25, YGO_FRAME.artFrame[0] - 0.01, 0.65];
+    const side: [number, number, number, number] = [YGO_FRAME.inner[0] + 0.01, 0.25, 0.08, 0.65];
     const stars = boxMask(px, w, h, YGO_FRAME.stars, 0.12, false, side);
     for (let i = 0; i < w * h; i++) stamp[i] = Math.max(stamp[i], stars[i]);
   }

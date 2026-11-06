@@ -1,5 +1,7 @@
 // Local API served by the Vite dev/preview server:
-//   GET    /api/search?game=mtg|pokemon|ygo&q=...&page=1
+//   GET    /api/search?game=mtg|pokemon|ygo&q=...&page=1  (optional: type, set, word=1)
+//   GET    /api/sets?game=mtg|pokemon|ygo     (sets to filter by, newest first)
+//   GET    /api/prices?game&id&name&foil&number  (TCGplayer / Cardmarket prices)
 //   GET    /api/img?u=<remote image url>     (downloads once, then serves from data/images)
 //   GET    /api/binders                       (summaries)
 //   GET    /api/binders/:id
@@ -12,6 +14,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { cardPrices } from './prices';
 
 // The image cache is capped (500 MB by default, BINDER_IMAGE_CACHE_MB to
 // change it). Past the cap, the least recently used images are deleted until
@@ -39,6 +42,7 @@ const IMAGE_HOSTS = new Set([
   'cards.scryfall.io',
   'backs.scryfall.io',
   'images.ygoprodeck.com',
+  'img.yugipedia.com',
   'assets.tcgdex.net',
   'images.pokemontcg.io',
   'tcg.pokemon.com',
@@ -59,6 +63,12 @@ export interface CardRef {
   image: string;
   large: string;
   back?: string;
+  /** Short rarity code of this printing, e.g. UR or SIR, when the source says. */
+  rarity?: string;
+  /** Yu-Gi-Oh! card type, e.g. Effect Monster. */
+  kind?: string;
+  /** Release date (YYYY-MM-DD) of the set this printing is from, when known. */
+  released?: string;
 }
 
 export function apiPlugin(): Plugin {
@@ -90,6 +100,11 @@ export function middleware(): Connect.NextHandleFunction {
 async function handle(req: IncomingMessage, res: ServerResponse, url: URL) {
   const p = url.pathname;
   if (p === '/api/search' && req.method === 'GET') return search(res, url);
+  if (p === '/api/sets' && req.method === 'GET') return listSets(res, url);
+  if (p === '/api/prices' && req.method === 'GET') {
+    const v = (k: string) => url.searchParams.get(k) ?? '';
+    return sendJson(res, 200, await cardPrices({ game: v('game'), id: v('id'), name: v('name'), foil: v('foil'), number: v('number') }));
+  }
   if (p === '/api/img' && req.method === 'GET') return image(res, url);
   if (p === '/api/binders' && req.method === 'GET') return listBinders(res);
   if (p === '/api/table' && req.method === 'GET') {
@@ -270,23 +285,62 @@ async function limited<T>(fn: () => Promise<T>): Promise<T> {
 
 // ---------- search ----------
 
+type Query = { q: string; page: number; type: string; set: string; word: boolean };
+type Result = { cards: CardRef[]; hasMore: boolean };
+
 async function search(res: ServerResponse, url: URL) {
   const game = url.searchParams.get('game');
-  const q = (url.searchParams.get('q') ?? '').trim();
-  const page = Math.max(1, Number(url.searchParams.get('page')) || 1);
-  if (!q) return sendJson(res, 200, { cards: [], hasMore: false });
+  const query: Query = {
+    q: (url.searchParams.get('q') ?? '').trim(),
+    page: Math.max(1, Number(url.searchParams.get('page')) || 1),
+    type: url.searchParams.get('type') ?? '',
+    set: url.searchParams.get('set') ?? '',
+    word: url.searchParams.get('word') === '1',
+  };
+  if (!query.q && !query.type && !query.set) return sendJson(res, 200, { cards: [], hasMore: false });
 
-  let result: { cards: CardRef[]; hasMore: boolean };
-  if (game === 'mtg') result = await searchScryfall(q, page);
-  else if (game === 'pokemon') result = await searchTcgdex(q, page);
-  else if (game === 'ygo') result = await searchYgo(q, page);
+  let result: Result;
+  if (game === 'mtg') result = await searchScryfall(query);
+  else if (game === 'pokemon') result = await searchTcgdex(query);
+  else if (game === 'ygo') result = await searchYgo(query);
   else return sendJson(res, 400, { error: 'unknown game' });
   sendJson(res, 200, result);
 }
 
-async function getJson(u: string): Promise<{ status: number; body: any }> {
+type SetInfo = { id: string; name: string; date: string };
+
+async function listSets(res: ServerResponse, url: URL) {
+  const game = url.searchParams.get('game');
+  const sets = game === 'mtg' ? await scryfallSets() : game === 'pokemon' ? await tcgdexSetList() : game === 'ygo' ? await ygoSets() : null;
+  if (!sets) return sendJson(res, 400, { error: 'unknown game' });
+  sendJson(res, 200, sets);
+}
+
+/** A whole-word, case-insensitive test for q, or null when q is empty. */
+function wordTest(q: string) {
+  if (!q) return null;
+  const re = new RegExp(`(^|[^\\p{L}\\p{N}])${q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^\\p{L}\\p{N}])`, 'iu');
+  return (name: string) => re.test(name);
+}
+
+const byDateDesc = (a: SetInfo, b: SetInfo) => b.date.localeCompare(a.date);
+
+/** Caches a list fetch; a failed one is tried again next time. */
+function cached<T>(load: () => Promise<T>) {
+  let p: Promise<T> | null = null;
+  return () => {
+    p ??= load().catch((err) => {
+      p = null;
+      throw err;
+    });
+    return p;
+  };
+}
+
+async function getJson(u: string, init?: RequestInit): Promise<{ status: number; body: any }> {
   const r = await fetch(u, {
-    headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
+    ...init,
+    headers: { 'User-Agent': USER_AGENT, Accept: 'application/json', ...init?.headers },
   });
   const text = await r.text();
   let body: any = null;
@@ -298,9 +352,28 @@ async function getJson(u: string): Promise<{ status: number; body: any }> {
   return { status: r.status, body };
 }
 
-async function searchScryfall(q: string, page: number) {
+// ----- Magic: Scryfall -----
+
+const MTG_TYPES = new Set(['creature', 'instant', 'sorcery', 'artifact', 'enchantment', 'planeswalker', 'land', 'battle']);
+const MTG_RARITY: Record<string, string> = { common: 'C', uncommon: 'U', rare: 'R', mythic: 'M', special: 'S', bonus: 'B' };
+
+const scryfallSets = cached(async () => {
+  const { status, body } = await getJson('https://api.scryfall.com/sets');
+  if (status !== 200) throw new Error(`Scryfall returned ${status}`);
+  return (body.data as any[])
+    .filter((s) => !s.digital)
+    .map((s): SetInfo => ({ id: s.code, name: s.name, date: s.released_at ?? '' }))
+    .sort(byDateDesc);
+});
+
+async function searchScryfall({ q, page, type, set, word }: Query): Promise<Result> {
+  const parts: string[] = [];
+  // Whole words: a name regex (Scryfall's regexes ignore case).
+  if (q) parts.push(word ? `name:/\\b${q.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}\\b/` : q);
+  if (MTG_TYPES.has(type)) parts.push(`t:${type}`);
+  if (/^[a-z0-9]+$/i.test(set)) parts.push(`s:${set}`);
   const u = new URL('https://api.scryfall.com/cards/search');
-  u.searchParams.set('q', q);
+  u.searchParams.set('q', parts.join(' '));
   u.searchParams.set('unique', 'prints');
   u.searchParams.set('order', 'released');
   u.searchParams.set('page', String(page));
@@ -323,19 +396,26 @@ async function searchScryfall(q: string, page: number) {
       image: front.normal,
       large: front.large,
       back,
+      ...(MTG_RARITY[c.rarity] ? { rarity: MTG_RARITY[c.rarity] } : {}),
     });
   }
   return { cards, hasMore: Boolean(body.has_more) };
 }
 
-let tcgdexSets: Promise<Map<string, string>> | null = null;
-function pokemonSets() {
-  tcgdexSets ??= getJson('https://api.tcgdex.net/v2/en/sets').then(({ body }) => {
-    const map = new Map<string, string>();
-    for (const s of body ?? []) map.set(s.id, s.name);
-    return map;
+// ----- Pokémon: TCGdex -----
+
+const tcgdexSetList = cached(async () => {
+  const { status, body } = await getJson('https://api.tcgdex.net/v2/graphql', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query: '{ sets { id name releaseDate } }' }),
   });
-  return tcgdexSets;
+  if (status !== 200 || !Array.isArray(body?.data?.sets)) throw new Error(`TCGdex returned ${status}`);
+  return (body.data.sets as any[]).map((s): SetInfo => ({ id: s.id, name: s.name, date: s.releaseDate ?? '' })).sort(byDateDesc);
+});
+
+async function pokemonSets() {
+  return new Map((await tcgdexSetList().catch(() => [] as SetInfo[])).map((s) => [s.id, s.name]));
 }
 
 // TCGdex has no images for some cards, mostly secret rares, gold cards,
@@ -401,26 +481,120 @@ async function ptcgImages(setId: string, setName: string, number: string, name: 
   return hit?.images ?? null;
 }
 
-async function searchTcgdex(q: string, page: number) {
+/** The filter's TCGdex category and trainer type. */
+const POKEMON_TYPES: Record<string, { category: string; trainerType?: string }> = {
+  pokemon: { category: 'Pokemon' },
+  trainer: { category: 'Trainer' },
+  supporter: { category: 'Trainer', trainerType: 'Supporter' },
+  item: { category: 'Trainer', trainerType: 'Item' },
+  tool: { category: 'Trainer', trainerType: 'Tool' },
+  stadium: { category: 'Trainer', trainerType: 'Stadium' },
+  energy: { category: 'Energy' },
+};
+
+/** Short codes for TCGdex's rarity names; anything else gets its initials. */
+const POKEMON_RARITY: Record<string, string> = {
+  common: 'C',
+  uncommon: 'U',
+  rare: 'R',
+  'holo rare': 'H',
+  'rare holo': 'H',
+  'holo rare v': 'V',
+  'holo rare vmax': 'VMAX',
+  'holo rare vstar': 'VSTAR',
+  'double rare': 'RR',
+  'ultra rare': 'UR',
+  'illustration rare': 'IR',
+  'special illustration rare': 'SIR',
+  'hyper rare': 'HR',
+  'mega hyper rare': 'MHR',
+  'secret rare': 'SR',
+  'shiny rare': 'S',
+  'shiny ultra rare': 'SSR',
+  'ace spec rare': 'ACE',
+  'amazing rare': 'A',
+  'radiant rare': 'K',
+  'rare prime': 'PRIME',
+  'legend': 'LEGEND',
+  'rare holo lv.x': 'LV.X',
+  'black white rare': 'BWR',
+  'full art trainer': 'FA',
+  'classic collection': 'CC',
+  promo: 'PR',
+};
+function pokemonRarity(r: unknown) {
+  if (typeof r !== 'string' || !r || r === 'None') return undefined;
+  const key = r.toLowerCase();
+  return POKEMON_RARITY[key] ?? r.split(/\s+/).map((w) => w[0].toUpperCase()).join('');
+}
+
+async function tcgdexQuery(query: string) {
+  const { status, body } = await getJson('https://api.tcgdex.net/v2/graphql', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query }),
+  });
+  // A card whose field breaks the schema comes back null with an error
+  // beside the rest, so errors only count when there is no data.
+  if (status !== 200 || !body?.data) throw new Error(body?.errors?.[0]?.message ?? `TCGdex returned ${status}`);
+  return body.data;
+}
+
+/**
+ * TCGdex cards from a GraphQL selection that ends in "{ fields }". A card
+ * without a rarity breaks TCGdex's schema and comes back null when it is
+ * asked for, so the rarities come from their own query, matched up by id.
+ */
+async function tcgdexCards(select: (fields: string) => string, list: (data: any) => any[] | undefined) {
+  const extra = ['rarity'] as const;
+  const [cards, ...more] = await Promise.all([
+    tcgdexQuery(select('id localId name image')),
+    ...extra.map((f) => tcgdexQuery(select(`id ${f}`)).catch(() => null)),
+  ]);
+  const values = extra.map((f, i) => {
+    const m = new Map<string, string>();
+    for (const c of (more[i] && list(more[i])) ?? []) if (c?.[f]) m.set(c.id, c[f]);
+    return m;
+  });
+  return (list(cards) ?? [])
+    .filter(Boolean)
+    .map((c) => ({ ...c, ...Object.fromEntries(extra.map((f, i) => [f, values[i].get(c.id)])) }));
+}
+
+async function searchTcgdex({ q, page, type, set, word }: Query): Promise<Result> {
   const per = 60;
-  const u = new URL('https://api.tcgdex.net/v2/en/cards');
-  u.searchParams.set('name', q);
-  u.searchParams.set('pagination:page', String(page));
-  u.searchParams.set('pagination:itemsPerPage', String(per));
-  const [{ status, body }, sets] = await Promise.all([getJson(u.toString()), pokemonSets()]);
-  if (status === 404) return { cards: [], hasMore: false };
-  if (status !== 200) throw new Error(`TCGdex returned ${status}`);
+  const kind = POKEMON_TYPES[type];
+  // TCGdex has no set filter, but every card id starts with its set's id.
+  const filters = [
+    set && `id: ${JSON.stringify(`${set}-`)}`,
+    q && `name: ${JSON.stringify(q)}`,
+    kind && `category: ${JSON.stringify(kind.category)}`,
+    kind?.trainerType && `trainerType: ${JSON.stringify(kind.trainerType)}`,
+  ]
+    .filter(Boolean)
+    .join(', ');
+  let list = await tcgdexCards(
+    (fields) => `{ cards(filters: {${filters}}, pagination: {page: ${page}, itemsPerPage: ${per}}) { ${fields} } }`,
+    (d) => d.cards,
+  );
+  const hasMore = list.length === per;
+  if (set) list = list.filter((c) => c.id.startsWith(`${set}-`));
+  const whole = word ? wordTest(q) : null;
+  if (whole) list = list.filter((c) => whole(c.name));
+  const sets = await pokemonSets();
 
   const found = await Promise.all(
-    (body as any[]).map(async (c): Promise<CardRef | null> => {
+    list.map(async (c): Promise<CardRef | null> => {
       const setId = c.id.slice(0, c.id.length - c.localId.length - 1);
-      const set = sets.get(setId) ?? setId;
+      const setName = sets.get(setId) ?? setId;
+      const rarity = pokemonRarity(c.rarity);
       const card = {
         game: 'pokemon' as const,
         id: c.id,
         name: c.name,
-        set,
+        set: setName,
         number: c.localId,
+        ...(rarity ? { rarity } : {}),
       };
       if (c.image) {
         return {
@@ -430,39 +604,105 @@ async function searchTcgdex(q: string, page: number) {
           large: `${c.image}/high.webp`,
         };
       }
-      const img = await ptcgImages(setId, set, c.localId, c.name).catch(() => null);
+      const img = await ptcgImages(setId, setName, c.localId, c.name).catch(() => null);
       return img && { ...card, thumb: img.small, image: img.large, large: img.large };
     }),
   );
-  return {
-    cards: found.filter((c) => c !== null),
-    hasMore: body.length === per,
-  };
+  return { cards: found.filter((c) => c !== null), hasMore };
 }
 
-async function searchYgo(q: string, page: number) {
+// ----- Yu-Gi-Oh!: YGOPRODeck -----
+
+const YGO_MONSTERS: Record<string, string[]> = {
+  normal: ['Normal Monster', 'Normal Tuner Monster'],
+  effect: [
+    'Effect Monster',
+    'Flip Effect Monster',
+    'Flip Tuner Effect Monster',
+    'Gemini Monster',
+    'Spirit Monster',
+    'Toon Monster',
+    'Tuner Monster',
+    'Union Effect Monster',
+  ],
+  ritual: ['Ritual Monster', 'Ritual Effect Monster', 'Pendulum Effect Ritual Monster'],
+  fusion: ['Fusion Monster', 'Pendulum Effect Fusion Monster'],
+  synchro: ['Synchro Monster', 'Synchro Tuner Monster', 'Synchro Pendulum Effect Monster'],
+  xyz: ['XYZ Monster', 'XYZ Pendulum Effect Monster'],
+  pendulum: [
+    'Pendulum Effect Monster',
+    'Pendulum Normal Monster',
+    'Pendulum Flip Effect Monster',
+    'Pendulum Tuner Effect Monster',
+    'Pendulum Effect Ritual Monster',
+    'Pendulum Effect Fusion Monster',
+    'Synchro Pendulum Effect Monster',
+    'XYZ Pendulum Effect Monster',
+  ],
+  link: ['Link Monster'],
+};
+const YGO_TYPES: Record<string, string[]> = {
+  ...YGO_MONSTERS,
+  monster: [...new Set(Object.values(YGO_MONSTERS).flat())],
+  spell: ['Spell Card'],
+  trap: ['Trap Card'],
+};
+
+const ygoSets = cached(async () => {
+  const { status, body } = await getJson('https://db.ygoprodeck.com/api/v7/cardsets.php');
+  if (status !== 200 || !Array.isArray(body)) throw new Error(`YGOPRODeck returned ${status}`);
+  const seen = new Set<string>();
+  return (body as any[])
+    .filter((s) => !seen.has(s.set_name) && seen.add(s.set_name))
+    .map((s): SetInfo => ({ id: s.set_name, name: s.set_name, date: s.tcg_date ?? '' }))
+    .sort(byDateDesc);
+});
+
+async function searchYgo({ q, page, type, set, word }: Query): Promise<Result> {
   const per = 40;
   const u = new URL('https://db.ygoprodeck.com/api/v7/cardinfo.php');
-  u.searchParams.set('fname', q);
+  if (q) u.searchParams.set('fname', q);
+  if (YGO_TYPES[type]) u.searchParams.set('type', YGO_TYPES[type].join(','));
+  if (set) u.searchParams.set('cardset', set);
   u.searchParams.set('num', String(per));
   u.searchParams.set('offset', String((page - 1) * per));
-  const { status, body } = await getJson(u.toString());
+  const [{ status, body }, sets] = await Promise.all([getJson(u.toString()), ygoSets().catch(() => [] as SetInfo[])]);
   if (status === 400 && body?.error) return { cards: [], hasMore: false };
   if (status !== 200) throw new Error(`YGOPRODeck returned ${status}`);
+  const released = new Map(sets.map((s) => [s.name, s.date || '9999']));
+  const whole = word ? wordTest(q) : null;
 
   const cards: CardRef[] = [];
   for (const c of body.data) {
-    for (const img of c.card_images ?? []) {
-      cards.push({
-        game: 'ygo',
-        id: String(img.id),
-        name: c.name,
-        set: c.humanReadableCardType ?? c.type,
-        number: c.card_sets?.[0]?.set_code ?? '',
-        thumb: img.image_url_small,
-        image: img.image_url,
-        large: img.image_url,
-      });
+    if (whole && !whole(c.name)) continue;
+    const printings: any[] = c.card_sets ?? [];
+    // In a chosen set, each of its printings, once per rarity (the regional
+    // codes of one printing are listed separately); otherwise the card's
+    // first printing.
+    const rarities = new Set<string>();
+    const shown = set
+      ? printings.filter((p) => p.set_name === set && !rarities.has(p.set_rarity) && rarities.add(p.set_rarity))
+      : printings.slice().sort((a, b) => (released.get(a.set_name) ?? '9999').localeCompare(released.get(b.set_name) ?? '9999')).slice(0, 1);
+    // Filtered by set, the images repeat once per regional printing too.
+    const images = [...new Map((c.card_images ?? []).map((img: any) => [img.id, img])).values()] as any[];
+    for (const img of images) {
+      for (const p of shown.length ? shown : [null]) {
+        const rarity = p?.set_rarity_code?.replace(/[()]/g, '');
+        const date = p ? released.get(p.set_name) : undefined;
+        cards.push({
+          game: 'ygo',
+          id: String(img.id),
+          name: c.name,
+          set: p?.set_name ?? c.humanReadableCardType ?? c.type,
+          number: p?.set_code ?? '',
+          thumb: img.image_url_small,
+          image: img.image_url,
+          large: img.image_url,
+          kind: c.humanReadableCardType ?? c.type,
+          ...(rarity ? { rarity } : {}),
+          ...(date && date !== '9999' ? { released: date } : {}),
+        });
+      }
     }
   }
   return { cards, hasMore: (body.meta?.rows_remaining ?? 0) > 0 };

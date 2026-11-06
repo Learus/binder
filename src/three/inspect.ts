@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { imgUrl } from '../api';
 import { CARD_BACK, CARD_SIZE } from '../foils';
 import type { Game, PrintLook, Slot } from '../types';
-import { createCardMaterial, createSharedUniforms, setCardFoil, setCardFoilMap, setCardTexture } from './holoMaterial';
+import { createCardMaterial, createSharedUniforms, setCardFoil, setCardFoilMap, setCardTexture, setCardWear } from './holoMaterial';
 import type { BinderScene } from './binderScene';
 import { cardBackTexture, queueFoilMap } from './textures';
 import { buildSlab, SLAB_CARD_Y, SLAB_CARD_Z, SLAB_H, SLAB_T, SLAB_W, SlabKit } from './slab';
@@ -101,6 +101,7 @@ export class InspectView {
     this.front = new THREE.Mesh(geo, createCardMaterial(game, slot.foil, this.shared, slot));
     this.back = new THREE.Mesh(geo, createCardMaterial(game, 'none', this.shared));
     this.back.rotation.y = Math.PI;
+    setCardWear(this.back.material, slot, true);
     if (inSlab) {
       const slab = buildSlab(this.slabKit, slot.card, this.slabTop);
       // Centre the slab on the spin axis.
@@ -165,6 +166,7 @@ export class InspectView {
 
   setFoil(foil: Slot['foil'], look: PrintLook = {}) {
     if (this.front) setCardFoil(this.front.material, this.game, foil, look);
+    if (this.back) setCardWear(this.back.material, look, true);
   }
 
   flip() {

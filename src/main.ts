@@ -1,10 +1,14 @@
 import * as api from './api';
-import { foilAges, foilLabel, normalizeFoil, printAge, RARITIES } from './foils';
+import { foilAges, foilLabel, hasOldFrame, oldFrameByDefault, normalizeFoil, printAge, RARITIES } from './foils';
+import tcgplayerLogo from './assets/logos/tcgplayer.png';
+import cardmarketLogo from './assets/logos/cardmarket.png';
+import cardtraderLogo from './assets/logos/cardtrader.png';
+import { CONDITION_KEYS, CONDITION_LABELS, conditionOf, GRADES, gradeOf, isMint } from './condition';
 import { BinderScene } from './three/binderScene';
 import { TABLE_SLOTS, type TableEntry } from './three/shelf';
 import { InspectView } from './three/inspect';
 import type { SlotHit } from './three/pageView';
-import { layoutOf, type Binder, type BinderLayout, type BinderSummary, type CardRef, type FoilKey, type Game, type Slot } from './types';
+import { layoutOf, type Binder, type BinderLayout, type BinderSummary, type CardRef, type Condition, type FoilKey, type Game, type Slot } from './types';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -20,6 +24,10 @@ const ui = {
   gameTabs: $('game-tabs'),
   searchForm: $<HTMLFormElement>('search-form'),
   searchInput: $<HTMLInputElement>('search-input'),
+  searchWord: $<HTMLButtonElement>('search-word'),
+  searchType: $<HTMLSelectElement>('search-type'),
+  searchSet: $<HTMLInputElement>('search-set'),
+  searchSets: $<HTMLDataListElement>('search-sets'),
   foilSelect: $<HTMLSelectElement>('foil-select'),
   targetInfo: $('target-info'),
   searchStatus: $('search-status'),
@@ -38,7 +46,14 @@ const ui = {
   inspectAgeValue: $('inspect-age-value'),
   inspectOldRow: $('inspect-old-row'),
   inspectOld: $<HTMLInputElement>('inspect-old'),
+  inspectGrade: $('inspect-grade'),
+  inspectGrades: $('inspect-grades'),
+  inspectWear: $('inspect-wear'),
+  inspectPrices: $('inspect-prices'),
   inspectFlip: $<HTMLButtonElement>('inspect-flip'),
+  inspectPrev: $<HTMLButtonElement>('inspect-prev'),
+  inspectNext: $<HTMLButtonElement>('inspect-next'),
+  inspectPos: $('inspect-pos'),
   inspectSelect: $<HTMLButtonElement>('inspect-select'),
   inspectRemove: $<HTMLButtonElement>('inspect-remove'),
   inspectClose: $<HTMLButtonElement>('inspect-close'),
@@ -63,7 +78,7 @@ let selected: SlotHit | null = null;
 let inspecting: SlotHit | null = null;
 let game: Game = 'pokemon';
 const foilForNew: Record<Game, FoilKey> = { pokemon: 'none', mtg: 'none', ygo: 'none' };
-let search = { q: '', page: 1, hasMore: false, busy: false };
+let search = { q: '', page: 1, hasMore: false, busy: false, filters: { type: '', set: '', word: false } as api.SearchFilters };
 
 if (!document.createElement('canvas').getContext('webgl2')) {
   document.body.innerHTML =
@@ -77,6 +92,11 @@ const scene = new BinderScene($<HTMLCanvasElement>('view'), {
   onTableBinderClick: (id) => void switchTo(id),
   onEmptySlotClick: (slot) => void newBinderInSlot(slot),
   onClosedBinderClick: () => void toggleClosed(),
+  canDragSlot: (hit) => !!binder?.pages[hit.page]?.[hit.slot],
+  onCardDragStart: (hit, e) => {
+    const slot = binder?.pages[hit.page][hit.slot];
+    if (slot) startDrag(slot, hit, e);
+  },
 });
 const inspect = new InspectView(scene);
 inspect.onDismiss = closeInspect;
@@ -405,6 +425,7 @@ function parseImport(raw: unknown): Binder {
         foil: normalizeFoil(slot.card.game, String(slot.foil)),
         ...(slot.age != null && age >= 0 && age <= 1 ? { age } : {}),
         ...(slot.oldFrame === true && slot.card.game === 'ygo' ? { oldFrame: true } : {}),
+        ...(isMint(conditionOf(slot.condition)) ? {} : { condition: conditionOf(slot.condition) }),
       };
     }),
   );
@@ -421,17 +442,51 @@ ui.binderCover.addEventListener('input', () => {
   binder.cover = ui.binderCover.value;
   changed();
 });
+/**
+ * The pages + Sheet and − Sheet work on: the open spread's two pages, or just
+ * page 1 on the front cover. Pages always come in sheets of two, so a single
+ * page added or removed at the front is balanced by an empty page at the end.
+ */
+function spreadPages(): { at: number; count: 1 | 2 } {
+  const s = scene.currentSpread;
+  return s === 0 ? { at: 0, count: 1 } : { at: 2 * s - 1, count: 2 };
+}
+
+/**
+ * Keep the selected pocket on the same card after `removed` pages at `at`
+ * were replaced by `added` ones; drop it if its page went.
+ */
+function shiftSelection(at: number, removed: number, added: number) {
+  if (!selected || selected.page < at) return;
+  if (selected.page < at + removed) setSelected(null);
+  else setSelected({ ...selected, page: selected.page - removed + added });
+}
+
+// New pages go in where the binder is open, pushing the pages there to the right.
 ui.sheetAdd.addEventListener('click', () => {
-  if (!binder) return;
-  binder.pages.push(...emptyPages(1, pocketsOf(binder)));
+  if (!binder || scene.isTurning || scene.isClosed) return;
+  const { at, count } = spreadPages();
+  const blank = emptyPages(1, pocketsOf(binder));
+  binder.pages.splice(at, 0, ...blank.slice(0, count));
+  if (count === 1) binder.pages.push(blank[1]);
+  shiftSelection(at, 0, count);
   changed();
 });
+// And come out from the same place, pulling the following pages back.
 ui.sheetRemove.addEventListener('click', () => {
-  if (!binder || binder.pages.length <= 2) return;
-  const last = binder.pages.slice(-2).flat().filter(Boolean).length;
-  if (last && !confirm(`The last sheet holds ${last} card(s). Remove it anyway?`)) return;
-  binder.pages.splice(-2, 2);
-  if (selected && selected.page >= binder.pages.length) setSelected(null);
+  if (!binder || binder.pages.length <= 2 || scene.isTurning || scene.isClosed) return;
+  const { at, count } = spreadPages();
+  const gone = binder.pages.slice(at, at + count);
+  const cards = gone.flat().filter(Boolean).length;
+  const which = count === 1 ? `Page ${at + 1}` : `Pages ${at + 1}–${at + gone.length}`;
+  if (cards && !confirm(`${which} hold${count === 1 ? 's' : ''} ${cards} card(s). Remove anyway?`)) return;
+  binder.pages.splice(at, count);
+  if (binder.pages.length % 2) {
+    // An odd page left over: drop an empty last page, or add one.
+    if (binder.pages.at(-1)!.every((s) => !s)) binder.pages.pop();
+    else binder.pages.push(...emptyPages(1, pocketsOf(binder)).slice(0, 1));
+  }
+  shiftSelection(at, count, 0);
   changed();
 });
 
@@ -495,7 +550,7 @@ function placeCard(card: CardRef) {
     binder.pages.push(...emptyPages(1, pocketsOf(binder)));
     target = { page: binder.pages.length - 2, slot: 0 };
   }
-  binder.pages[target.page][target.slot] = { card, foil: foilForNew[card.game] };
+  binder.pages[target.page][target.slot] = newSlot(card);
 
   if (selected) {
     // Walk the selection forward so a row of clicks fills pockets in order.
@@ -564,6 +619,126 @@ function toast(text: string) {
   toastTimer = window.setTimeout(() => ui.toast.classList.remove('show'), 1800);
 }
 
+// ---------- drag and drop ----------
+
+/**
+ * A card being dragged: from the search results (`from` is null) or from a
+ * pocket. Dropping on a pocket moves it there (swapping with what's there);
+ * with Shift held, or from the search results, a copy goes there instead.
+ */
+interface CardDrag {
+  slot: Slot;
+  from: SlotHit | null;
+  ghost: HTMLElement;
+  target: SlotHit | null;
+  x: number;
+  y: number;
+  shift: boolean;
+  /** Held beside the binder: which side and since when, to turn the page. */
+  edge: { dir: -1 | 1; at: number } | null;
+  timer: number;
+}
+let drag: CardDrag | null = null;
+/** A press on a search result that may turn into a drag. */
+let resultPress: { card: CardRef; x: number; y: number } | null = null;
+
+/** A search result as it goes into a pocket. */
+function newSlot(card: CardRef): Slot {
+  return { card, foil: foilForNew[card.game], ...(oldFrameByDefault(card) ? { oldFrame: true } : {}) };
+}
+let suppressResultClick = false;
+
+const isCopy = (d: CardDrag) => !d.from || d.shift;
+
+function startDrag(slot: Slot, from: SlotHit | null, e: PointerEvent) {
+  if (!binder || inspecting) return;
+  const ghost = document.createElement('div');
+  ghost.className = 'drag-ghost';
+  const img = document.createElement('img');
+  img.src = api.imgUrl(slot.card.thumb);
+  img.alt = '';
+  ghost.append(img);
+  document.body.append(ghost);
+  drag = { slot, from, ghost, target: null, x: e.clientX, y: e.clientY, shift: e.shiftKey, edge: null, timer: 0 };
+  drag.timer = window.setInterval(checkDragEdge, 100);
+  document.body.classList.add('dragging-card');
+  moveDrag(e.clientX, e.clientY, e.shiftKey);
+}
+
+function moveDrag(x: number, y: number, shift: boolean) {
+  const d = drag;
+  if (!d) return;
+  Object.assign(d, { x, y, shift });
+  d.ghost.style.transform = `translate(${x}px, ${y}px)`;
+  d.ghost.classList.toggle('copy', isCopy(d));
+  d.target = scene.slotAtClient(x, y);
+  scene.setCardDrag(d.target, isCopy(d) ? null : d.from);
+}
+
+/** Holding the card beside the binder turns the page that way, so it can go to another spread. */
+function checkDragEdge() {
+  const d = drag;
+  if (!d) return;
+  const dir = scene.edgeAtClient(d.x, d.y);
+  if (!dir) {
+    d.edge = null;
+    return;
+  }
+  const now = performance.now();
+  // Turn after a short hold, and again only once each turn has landed.
+  if (d.edge?.dir !== dir || scene.isTurning) d.edge = { dir, at: now };
+  else if (now - d.edge.at > 600) scene.turnPage(dir);
+  // The pocket under the card changes as the page turns.
+  moveDrag(d.x, d.y, d.shift);
+}
+
+function endDrag(drop: boolean) {
+  const d = drag;
+  if (!d) return;
+  drag = null;
+  clearInterval(d.timer);
+  d.ghost.remove();
+  document.body.classList.remove('dragging-card');
+  scene.setCardDrag(null, null);
+  const to = drop && binder ? scene.slotAtClient(d.x, d.y) : null;
+  if (!binder || !to) return;
+  const pages = binder.pages;
+  const there = pages[to.page][to.slot];
+  if (isCopy(d)) {
+    pages[to.page][to.slot] = structuredClone(d.slot);
+    if (there) toast(`Replaced ${there.card.name}`);
+  } else {
+    const from = d.from!;
+    if (from.page === to.page && from.slot === to.slot) return;
+    // Moving onto a card swaps the two.
+    pages[to.page][to.slot] = pages[from.page][from.slot];
+    pages[from.page][from.slot] = there;
+  }
+  changed();
+}
+
+window.addEventListener('pointermove', (e) => {
+  const press = resultPress;
+  if (press && !drag && Math.hypot(e.clientX - press.x, e.clientY - press.y) > 6) {
+    resultPress = null;
+    suppressResultClick = true;
+    startDrag(newSlot(press.card), null, e);
+  }
+  if (drag) moveDrag(e.clientX, e.clientY, e.shiftKey);
+});
+window.addEventListener('pointerup', () => {
+  resultPress = null;
+  endDrag(true);
+  // The click that follows a drag isn't a click.
+  setTimeout(() => (suppressResultClick = false));
+});
+window.addEventListener('pointercancel', () => endDrag(false));
+for (const type of ['keydown', 'keyup'] as const) {
+  window.addEventListener(type, (e) => {
+    if (drag && e.key === 'Shift') moveDrag(drag.x, drag.y, type === 'keydown');
+  });
+}
+
 ui.closeToggle.addEventListener('click', () => void toggleClosed());
 ui.prev.addEventListener('click', () => scene.turnPage(-1));
 ui.next.addEventListener('click', () => scene.turnPage(1));
@@ -630,12 +805,45 @@ function openInspect(hit: SlotHit) {
   inspecting = hit;
   inspect.show(slot, layoutOf(binder).type === 'slab');
   ui.inspectName.textContent = slot.card.name;
-  ui.inspectSet.textContent = [slot.card.set, slot.card.number && `#${slot.card.number}`, `page ${hit.page + 1}`]
+  ui.inspectSet.textContent = [slot.card.set, slot.card.number && `#${slot.card.number}`, slot.card.rarity, `page ${hit.page + 1}`]
     .filter(Boolean)
     .join(' · ');
   fillFoilSelect(ui.inspectFoil, slot.card.game, slot.foil);
   showAge(slot);
+  showPrices(slot);
+  showCardNav(hit);
   ui.inspectPanel.hidden = false;
+}
+
+/** The next (or previous) filled pocket after `hit`, across pages. */
+function neighbour(hit: SlotHit, dir: 1 | -1): SlotHit | null {
+  if (!binder) return null;
+  let { page, slot } = hit;
+  for (;;) {
+    slot += dir;
+    if (slot < 0 || slot >= (binder.pages[page]?.length ?? 0)) {
+      page += dir;
+      if (page < 0 || page >= binder.pages.length) return null;
+      slot = dir > 0 ? 0 : binder.pages[page].length - 1;
+    }
+    if (binder.pages[page][slot]) return { page, slot };
+  }
+}
+
+function showCardNav(hit: SlotHit) {
+  ui.inspectPrev.disabled = !neighbour(hit, -1);
+  ui.inspectNext.disabled = !neighbour(hit, 1);
+  const filled = binder!.pages.flatMap((p, pi) => p.map((s, si) => (s ? pi * 1000 + si : -1))).filter((k) => k >= 0);
+  ui.inspectPos.textContent = `${filled.indexOf(hit.page * 1000 + hit.slot) + 1} / ${filled.length}`;
+}
+
+/** Look at the next or previous card, turning the binder to its page behind the close-up. */
+function stepInspect(dir: 1 | -1) {
+  const next = inspecting && neighbour(inspecting, dir);
+  if (!next) return;
+  const spread = spreadOfPage(next.page);
+  if (spread !== scene.currentSpread) scene.turnTo(spread);
+  openInspect(next);
 }
 
 function closeInspect() {
@@ -652,16 +860,142 @@ ui.inspectFoil.addEventListener('change', () => {
   delete slot.age;
   inspect.setFoil(slot.foil, slot);
   showAge(slot);
+  showPrices(slot);
   changed();
 });
+
+// ---------- prices ----------
+
+let pricesRun = 0;
+
+const MARKET_LOGOS: Record<string, string> = { TCGplayer: tcgplayerLogo, Cardmarket: cardmarketLogo, CardTrader: cardtraderLogo };
+
+/** A marketplace name with its logo, as a link when there's a url. */
+function market(source: string, url?: string) {
+  const e = url ? el('a') : el('span');
+  e.className = 'market';
+  if (e instanceof HTMLAnchorElement && url) {
+    e.href = url;
+    e.target = '_blank';
+    e.rel = 'noopener noreferrer';
+  }
+  const logo = MARKET_LOGOS[source];
+  if (logo) {
+    const img = el('img');
+    img.src = logo;
+    img.alt = '';
+    e.append(img);
+  }
+  e.append(source);
+  return e;
+}
+
+function money(v: number | null, currency: 'USD' | 'EUR') {
+  if (v === null) return '–';
+  return new Intl.NumberFormat(undefined, { style: 'currency', currency, maximumFractionDigits: v >= 1000 ? 0 : 2 }).format(v);
+}
+
+function el<K extends keyof HTMLElementTagNameMap>(tag: K, text = '', cls = '') {
+  const e = document.createElement(tag);
+  e.textContent = text;
+  if (cls) e.className = cls;
+  return e;
+}
+
+async function showPrices(slot: Slot) {
+  const run = ++pricesRun;
+  const box = ui.inspectPrices;
+  box.replaceChildren(el('span', 'Prices'), el('span', 'Looking up prices…', 'muted'));
+  let prices: api.CardPrices;
+  try {
+    prices = await api.cardPrices(slot.card, slot.foil);
+  } catch (err) {
+    if (run === pricesRun) box.replaceChildren(el('span', 'Prices'), el('span', `Couldn't get prices: ${(err as Error).message}`, 'muted'));
+    return;
+  }
+  if (run !== pricesRun) return;
+  box.replaceChildren(el('span', 'Prices'));
+  if (!prices.groups.length) box.append(el('span', `No prices for ${foilLabel(slot.card.game, slot.foil)}.`, 'muted'));
+  for (const g of prices.groups) {
+    const table = el('table');
+    const head = el('tr');
+    head.append(el('th'), el('th', 'Low'), el('th', 'Trend'), el('th', 'High'));
+    table.append(head);
+    for (const r of g.rows) {
+      const tr = el('tr');
+      const name = el('td');
+      name.append(market(r.source, r.url));
+      tr.append(name, el('td', money(r.low, r.currency)), el('td', money(r.trend, r.currency)), el('td', money(r.high, r.currency)));
+      table.append(tr);
+    }
+    box.append(el('h4', g.title), table);
+    if (g.note) box.append(el('span', g.note, 'muted'));
+  }
+  if (prices.links.length) {
+    const links = el('div', '', 'market-links');
+    links.append(el('span', 'Search', 'muted'), ...prices.links.map((l) => market(l.source, l.url)));
+    box.append(links);
+  }
+}
 
 function showAge(slot: Slot) {
   ui.inspectAgeRow.hidden = !foilAges(slot.card.game, slot.foil);
   const age = printAge(slot.card.game, slot.foil, slot.age);
   ui.inspectAge.value = String(age);
   ui.inspectAgeValue.textContent = ageLabel(age);
-  ui.inspectOldRow.hidden = slot.card.game !== 'ygo';
+  ui.inspectOldRow.hidden = !hasOldFrame(slot.card);
   ui.inspectOld.checked = Boolean(slot.oldFrame);
+  showCondition(slot);
+}
+
+// ---------- condition ----------
+
+const gradeButtons = GRADES.map((g) => {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.textContent = g.key;
+  b.title = g.name;
+  b.addEventListener('click', () => setCondition({ ...g.condition }, true));
+  ui.inspectGrades.append(b);
+  return b;
+});
+
+const wearSliders = CONDITION_KEYS.map((key) => {
+  const label = document.createElement('label');
+  label.htmlFor = `wear-${key}`;
+  label.textContent = CONDITION_LABELS[key];
+  const input = document.createElement('input');
+  input.type = 'range';
+  input.id = `wear-${key}`;
+  input.min = '0';
+  input.max = '1';
+  input.step = '0.05';
+  // Dragging updates the close-up live; the binder page rebuilds on release.
+  input.addEventListener('input', () => {
+    const slot = inspecting && binder?.pages[inspecting.page][inspecting.slot];
+    if (slot) setCondition({ ...conditionOf(slot.condition), [key]: Number(input.value) }, false);
+  });
+  input.addEventListener('change', () => changed());
+  ui.inspectWear.append(label, input);
+  return input;
+});
+
+function setCondition(c: Condition, save: boolean) {
+  const slot = inspecting && binder?.pages[inspecting.page][inspecting.slot];
+  if (!slot) return;
+  if (isMint(c)) delete slot.condition;
+  else slot.condition = c;
+  inspect.setFoil(slot.foil, slot);
+  showCondition(slot);
+  if (save) changed();
+}
+
+function showCondition(slot: Slot) {
+  const c = conditionOf(slot.condition);
+  CONDITION_KEYS.forEach((k, i) => (wearSliders[i].value = String(c[k])));
+  const grade = gradeOf(c);
+  gradeButtons.forEach((b, i) => b.setAttribute('aria-pressed', String(GRADES[i].key === grade)));
+  ui.inspectGrade.textContent = grade ? GRADES.find((g) => g.key === grade)!.name : 'custom';
 }
 
 function ageLabel(age: number) {
@@ -689,6 +1023,8 @@ ui.inspectOld.addEventListener('change', () => {
   changed();
 });
 ui.inspectFlip.addEventListener('click', () => inspect.flip());
+ui.inspectPrev.addEventListener('click', () => stepInspect(-1));
+ui.inspectNext.addEventListener('click', () => stepInspect(1));
 ui.inspectClose.addEventListener('click', closeInspect);
 ui.inspectSelect.addEventListener('click', () => {
   const hit = inspecting;
@@ -704,52 +1040,159 @@ ui.inspectRemove.addEventListener('click', () => {
 
 // ---------- search ----------
 
+/** The type filter's choices per game: [key the server knows, label]. */
+const CARD_TYPES: Record<Game, [string, string][]> = {
+  pokemon: [
+    ['pokemon', 'Pokémon'],
+    ['trainer', 'Trainer (any)'],
+    ['supporter', 'Supporter'],
+    ['item', 'Item'],
+    ['tool', 'Pokémon Tool'],
+    ['stadium', 'Stadium'],
+    ['energy', 'Energy'],
+  ],
+  mtg: [
+    ['creature', 'Creature'],
+    ['instant', 'Instant'],
+    ['sorcery', 'Sorcery'],
+    ['artifact', 'Artifact'],
+    ['enchantment', 'Enchantment'],
+    ['planeswalker', 'Planeswalker'],
+    ['land', 'Land'],
+    ['battle', 'Battle'],
+  ],
+  ygo: [
+    ['monster', 'Monster (any)'],
+    ['normal', 'Normal Monster'],
+    ['effect', 'Effect Monster'],
+    ['ritual', 'Ritual Monster'],
+    ['fusion', 'Fusion Monster'],
+    ['synchro', 'Synchro Monster'],
+    ['xyz', 'Xyz Monster'],
+    ['pendulum', 'Pendulum Monster'],
+    ['link', 'Link Monster'],
+    ['spell', 'Spell'],
+    ['trap', 'Trap'],
+  ],
+};
+
+const setLists = new Map<Game, Promise<api.SetInfo[]>>();
+function setsOf(g: Game) {
+  let p = setLists.get(g);
+  if (!p) {
+    p = api.listSets(g);
+    p.catch(() => setLists.delete(g));
+    setLists.set(g, p);
+  }
+  return p;
+}
+
+/** How a set reads in the set box; Yu-Gi-Oh! sets are known by name alone. */
+function setLabel(s: api.SetInfo) {
+  return s.id === s.name ? s.name : `${s.name} (${s.id.toUpperCase()})`;
+}
+
+async function fillSetList(g: Game) {
+  ui.searchSets.replaceChildren();
+  const sets = await setsOf(g).catch(() => []);
+  if (g !== game) return;
+  ui.searchSets.replaceChildren(
+    ...sets.map((s) => {
+      const o = document.createElement('option');
+      o.value = setLabel(s);
+      if (s.date) o.label = s.date.slice(0, 4);
+      return o;
+    }),
+  );
+}
+
+/** The set the set box names, '' for none, or null when it names no known set. */
+async function chosenSet(): Promise<string | null> {
+  const v = ui.searchSet.value.trim().toLowerCase();
+  if (!v) return '';
+  const sets = await setsOf(game).catch(() => []);
+  const hit = sets.find((s) => setLabel(s).toLowerCase() === v) ?? sets.find((s) => s.name.toLowerCase() === v || s.id.toLowerCase() === v);
+  return hit ? hit.id : null;
+}
+
 function setGame(g: Game) {
   game = g;
   for (const b of ui.gameTabs.querySelectorAll<HTMLButtonElement>('button')) b.classList.toggle('active', b.dataset.game === g);
   fillFoilSelect(ui.foilSelect, g, foilForNew[g]);
+  ui.searchType.replaceChildren(new Option('Any type', ''), ...CARD_TYPES[g].map(([key, label]) => new Option(label, key)));
+  ui.searchSet.value = '';
+  void fillSetList(g);
   ui.searchInput.placeholder =
     g === 'mtg' ? 'Card name or Scryfall syntax, e.g. "bolt" or "t:dragon r:mythic"' : g === 'pokemon' ? 'Card name, e.g. Charizard' : 'Card name, e.g. Dark Magician';
   ui.results.replaceChildren();
   ui.loadMore.hidden = true;
   ui.searchStatus.textContent = '';
-  if (search.q) void runSearch(search.q, 1);
+  // The filters were reset for the new game; the name carries over.
+  if (search.q) void newSearch();
+  else searchRun++;
 }
 
-async function runSearch(q: string, page: number) {
-  if (search.busy) return;
-  search = { q, page, hasMore: false, busy: true };
+/** A new search from the box and filters; nothing happens while they are all empty. */
+async function newSearch() {
+  const q = ui.searchInput.value.trim();
+  const set = await chosenSet();
+  if (set === null) {
+    ui.searchStatus.textContent = 'Pick a set from the list.';
+    return;
+  }
+  const filters = { type: ui.searchType.value, set, word: ui.searchWord.getAttribute('aria-pressed') === 'true' };
+  if (q || filters.type || filters.set) void runSearch(q, 1, filters);
+}
+
+/** Counts searches, so a newer one replaces the results of any still running. */
+let searchRun = 0;
+
+async function runSearch(q: string, page: number, filters = search.filters) {
+  // Load more waits for the page before it; a new search goes ahead.
+  if (page > 1 && search.busy) return;
+  const run = ++searchRun;
+  search = { q, page, hasMore: false, busy: true, filters };
   const forGame = game;
   if (page === 1) ui.results.replaceChildren();
   ui.searchStatus.textContent = 'Searching…';
   ui.loadMore.hidden = true;
   try {
-    const res = await api.searchCards(forGame, q, page);
-    if (forGame !== game) return;
+    const res = await api.searchCards(forGame, q, page, filters);
+    if (run !== searchRun || forGame !== game) return;
     search.hasMore = res.hasMore;
     for (const card of res.cards) ui.results.append(resultTile(card));
     const count = ui.results.childElementCount;
-    ui.searchStatus.textContent = count ? `${count}${res.hasMore ? '+' : ''} results. Click one to add it.` : 'No cards found.';
+    ui.searchStatus.textContent = count ? `${count}${res.hasMore ? '+' : ''} results. Click one to add it, or drag it to a pocket.` : 'No cards found.';
     ui.loadMore.hidden = !res.hasMore;
   } catch (err) {
-    ui.searchStatus.textContent = `Search failed: ${(err as Error).message}`;
+    if (run === searchRun) ui.searchStatus.textContent = `Search failed: ${(err as Error).message}`;
   } finally {
-    search.busy = false;
+    if (run === searchRun) search.busy = false;
   }
 }
 
 function resultTile(card: CardRef) {
   const b = document.createElement('button');
   b.className = 'result';
-  b.title = `${card.name}\n${card.set}${card.number ? ` #${card.number}` : ''}\nClick to add as ${foilLabel(card.game, foilForNew[card.game])}`;
+  b.title = `${card.name}\n${card.set}${card.number ? ` #${card.number}` : ''}${card.rarity ? ` (${card.rarity})` : ''}\nClick to add as ${foilLabel(card.game, foilForNew[card.game])}, or drag it to a pocket`;
   const img = document.createElement('img');
   img.loading = 'lazy';
   img.alt = card.name;
   img.src = api.imgUrl(card.thumb);
+  img.draggable = false;
   const label = document.createElement('span');
   label.textContent = card.set;
   b.append(img, label);
-  b.addEventListener('click', () => placeCard(card));
+  if (card.rarity) {
+    const tag = document.createElement('b');
+    tag.className = 'rarity';
+    tag.textContent = card.rarity;
+    b.append(tag);
+  }
+  b.addEventListener('click', () => !suppressResultClick && placeCard(card));
+  b.addEventListener('pointerdown', (e) => {
+    if (e.button === 0) resultPress = { card, x: e.clientX, y: e.clientY };
+  });
   return b;
 }
 
@@ -759,8 +1202,17 @@ ui.gameTabs.addEventListener('click', (e) => {
 });
 ui.searchForm.addEventListener('submit', (e) => {
   e.preventDefault();
-  const q = ui.searchInput.value.trim();
-  if (q) void runSearch(q, 1);
+  void newSearch();
+});
+ui.searchWord.addEventListener('click', () => {
+  ui.searchWord.setAttribute('aria-pressed', String(ui.searchWord.getAttribute('aria-pressed') !== 'true'));
+  void newSearch();
+});
+ui.searchType.addEventListener('change', () => void newSearch());
+// Picking from the list fires change; so do Enter and leaving the box.
+ui.searchSet.addEventListener('change', () => void newSearch());
+ui.searchSet.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') ui.searchSet.blur();
 });
 ui.loadMore.addEventListener('click', () => runSearch(search.q, search.page + 1));
 ui.foilSelect.addEventListener('change', () => {
@@ -772,7 +1224,8 @@ ui.foilSelect.addEventListener('change', () => {
 window.addEventListener('keydown', (e) => {
   const typing = e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement;
   if (e.key === 'Escape') {
-    if (pageTyped) {
+    if (drag) endDrag(false);
+    else if (pageTyped) {
       pageTyped = '';
       clearTimeout(pageTimer);
       updatePager();
@@ -790,6 +1243,8 @@ window.addEventListener('keydown', (e) => {
   }
   if (inspecting) {
     if (e.key === 'f' || e.key === 'F') inspect.flip();
+    else if (e.key === 'ArrowRight') stepInspect(1);
+    else if (e.key === 'ArrowLeft') stepInspect(-1);
     return;
   }
   if (/^[0-9]$/.test(e.key) && !e.ctrlKey && !e.metaKey && !e.altKey && !scene.isClosed) typePageDigit(e.key);
