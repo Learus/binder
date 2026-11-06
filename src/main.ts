@@ -82,7 +82,7 @@ let search = { q: '', page: 1, hasMore: false, busy: false, filters: { type: '',
 
 if (!document.createElement('canvas').getContext('webgl2')) {
   document.body.innerHTML =
-    '<p style="margin:auto;max-width:520px;padding:24px;line-height:1.6">Card Binder needs WebGL 2 for its 3D view, and this browser or graphics driver doesn\'t provide it. Updating your graphics driver or browser usually fixes this.</p>';
+    '<p style="margin:auto;max-width:520px;padding:24px;line-height:1.6">Card Binder Simulator needs WebGL 2 for its 3D view, and this browser or graphics driver doesn\'t provide it. Updating your graphics driver or browser usually fixes this.</p>';
   throw new Error('WebGL 2 unavailable');
 }
 (window as any).__dbg = 0;

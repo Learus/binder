@@ -1,4 +1,4 @@
-# Card Binder
+# Card Binder Simulator
 
 A 3D trading card binder for Pokémon, Magic and Yu-Gi-Oh! cards. Search cards, pick a rarity, put them in binder pockets, flip pages, inspect cards up close with holographic foils, and keep several binders on the table.
 
@@ -6,7 +6,7 @@ A 3D trading card binder for Pokémon, Magic and Yu-Gi-Oh! cards. Search cards, 
 
 Download the build for your system from the GitHub releases page:
 
-- **Windows:** `Card Binder-<version>-portable.exe` runs without installing (double-click it). `Card Binder-Setup-<version>.exe` is a regular installer.
+- **Windows:** `Card.Binder.Simulator-<version>-portable.exe` runs without installing (double-click it). `Card.Binder.Simulator-Setup-<version>.exe` is a regular installer.
 - **macOS:** `.dmg`. The build is unsigned, so the first launch needs right-click → Open.
 - **Linux:** `.AppImage`. Mark it executable, then run it.
 

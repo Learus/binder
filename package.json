@@ -1,7 +1,7 @@
 {
-  "name": "card-binder",
+  "name": "card-binder-simulator",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -31,7 +31,7 @@
   "main": "dist-electron/main.cjs",
   "build": {
     "appId": "io.github.learus.cardbinder",
-    "productName": "Card Binder",
+    "productName": "Card Binder Simulator",
     "directories": {
       "output": "release"
     },
@@ -42,6 +42,7 @@
     ],
     "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
     "win": {
+      "icon": "build/icon.ico",
       "target": [
         "portable",
         "nsis"
@@ -69,6 +70,6 @@
       "artifactName": "${productName}-${version}-portable.${ext}"
     }
   },
-  "desktopName": "card-binder.desktop",
+  "desktopName": "card-binder-simulator.desktop",
   "repository": "github:Learus/binder"
 }

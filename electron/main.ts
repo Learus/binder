@@ -4,6 +4,7 @@
 import { app, BrowserWindow, Menu, shell } from 'electron';
 import http from 'node:http';
 import fs from 'node:fs/promises';
+import { existsSync, renameSync } from 'node:fs';
 import path from 'node:path';
 import { middleware, setDataDir } from '../server/api';
 
@@ -61,7 +62,9 @@ async function start() {
     width: 1440,
     height: 900,
     backgroundColor: '#0c0a08',
-    title: 'Card Binder',
+    title: 'Card Binder Simulator',
+    // Windows and macOS take the icon from the packaged app; Linux needs it on the window.
+    icon: path.join(root, 'icon-512.png'),
     autoHideMenuBar: true,
   });
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -89,6 +92,22 @@ async function start() {
   await fs.mkdir(dataDir, { recursive: true });
   await win.loadURL(`http://127.0.0.1:${port}/`);
 }
+
+// The app was called "Card Binder" up to 0.2.0, and its app-data folder is
+// named after the app. Move the old folder over so binders and settings
+// (localStorage lives there too) carry across. Must run before anything
+// opens the folder, including the single-instance lock.
+function adoptOldUserData() {
+  const now = app.getPath('userData');
+  const old = path.join(path.dirname(now), 'Card Binder');
+  if (old === now || !existsSync(old) || existsSync(now)) return;
+  try {
+    renameSync(old, now);
+  } catch {
+    app.setPath('userData', old);
+  }
+}
+adoptOldUserData();
 
 // Without a usable GPU, let WebGL fall back to software rendering rather
 // than leaving the 3D view blank.
