@@ -59,6 +59,10 @@ export interface BinderSceneEvents {
   onEmptySlotClick(slot: number): void;
   /** The active binder was clicked while closed. */
   onClosedBinderClick(): void;
+  /** Whether the pocket holds a card that can be picked up. */
+  canDragSlot(hit: SlotHit): boolean;
+  /** The pointer moved far enough with a card held down: a drag starts. */
+  onCardDragStart(hit: SlotHit, e: PointerEvent): void;
 }
 
 interface Tween {
@@ -117,6 +121,12 @@ export class BinderScene {
   private raycaster = new THREE.Raycaster();
   private pointer = new THREE.Vector2(9, 9);
   private pointerDown: { x: number; y: number } | null = null;
+  /** A card pressed with the left button, not yet moved far enough to drag. */
+  private cardPress: { hit: SlotHit; x: number; y: number } | null = null;
+  private cardDragging = false;
+  /** Card drag in progress: the pocket it would drop into, and the pocket it left. */
+  private dropHit: SlotHit | null = null;
+  private hiddenSlot: SlotHit | null = null;
   private lightTarget = new THREE.Vector3(0, 22, 8);
   private timer = new THREE.Timer();
   private overlays: ((dt: number) => void)[] = [];
@@ -285,6 +295,7 @@ export class BinderScene {
 
     canvas.addEventListener('pointermove', (e) => {
       this.onPointerMove(e);
+      this.dragCard(e);
       this.dragTurn(e);
     });
     canvas.addEventListener('pointercancel', () => this.releaseDrag());
@@ -521,6 +532,32 @@ export class BinderScene {
     return { left, right, bottom };
   }
 
+  /** The pocket at a point on the page (client pixels), if the binder is open and idle. */
+  slotAtClient(x: number, y: number): SlotHit | null {
+    const r = this.canvas.getBoundingClientRect();
+    if (x < r.left || x > r.right || y < r.top || y > r.bottom) return null;
+    this.pointer.set(((x - r.left) / r.width) * 2 - 1, -((y - r.top) / r.height) * 2 + 1);
+    return this.pick();
+  }
+
+  /** -1 or 1 when a point is past the binder's left or right edge (beside it), else 0. */
+  edgeAtClient(x: number, y: number): -1 | 0 | 1 {
+    const r = this.canvas.getBoundingClientRect();
+    if (x < r.left || x > r.right || y < r.top || y > r.bottom) return 0;
+    this.pointer.set(((x - r.left) / r.width) * 2 - 1, -((y - r.top) / r.height) * 2 + 1);
+    const p = this.pagePoint();
+    if (!p || Math.abs(p.z) > PAGE_H / 2 + 2) return 0;
+    const outer = SPINE_GAP + PAGE_W;
+    return p.x < -outer ? -1 : p.x > outer ? 1 : 0;
+  }
+
+  /** While a card is dragged: highlight where it would land, and hide the card being moved. */
+  setCardDrag(drop: SlotHit | null, hidden: SlotHit | null) {
+    this.dropHit = drop;
+    this.hiddenSlot = hidden;
+    this.placeHighlight();
+  }
+
   setSelected(hit: SlotHit | null) {
     this.selected = hit;
     this.placeHighlight();
@@ -646,7 +683,7 @@ export class BinderScene {
   }
 
   private placeHighlight() {
-    const sel = this.selected;
+    const sel = this.dropHit ?? this.selected;
     const [l, r] = this.pagesOf(this.spread);
     const side = sel && !this.turn && this.closeAmount === 0 ? (sel.page === l ? 'left' : sel.page === r ? 'right' : null) : null;
     this.highlight.visible = side !== null;
@@ -784,6 +821,15 @@ export class BinderScene {
   private onPointerDown(e: PointerEvent) {
     this.pointerDown = { x: e.clientX, y: e.clientY };
     this.onPointerMove(e);
+    // A card picks up; anywhere else on the page's outer part grabs the page.
+    const hit = e.button === 0 && !this.blockInput ? this.pick() : null;
+    if (hit && this.events.canDragSlot(hit)) {
+      this.cardPress = { hit, x: e.clientX, y: e.clientY };
+      this.edgeGrab = null;
+      // Keep getting the release even when it lands outside the canvas.
+      this.canvas.setPointerCapture(e.pointerId);
+      return;
+    }
     const grab = e.button === 0 ? this.edgeUnderPointer() : null;
     this.edgeGrab = grab && { ...grab, x: e.clientX, y: e.clientY };
     if (grab) this.canvas.setPointerCapture(e.pointerId);
@@ -821,9 +867,22 @@ export class BinderScene {
     turn.dur = Math.max(0.15, TURN_SECONDS * Math.abs(turn.to - turn.from));
   }
 
+  private dragCard(e: PointerEvent) {
+    const press = this.cardPress;
+    if (!press || Math.hypot(e.clientX - press.x, e.clientY - press.y) < 6) return;
+    this.cardPress = null;
+    this.cardDragging = true;
+    this.events.onCardDragStart(press.hit, e);
+  }
+
   private onPointerUp(e: PointerEvent) {
     const down = this.pointerDown;
     this.pointerDown = null;
+    this.cardPress = null;
+    if (this.cardDragging) {
+      this.cardDragging = false;
+      return;
+    }
     if (this.turn?.drag) return this.releaseDrag();
     this.edgeGrab = null;
     if (!down || this.blockInput || this.busy || e.button !== 0) return;
@@ -941,7 +1000,7 @@ export class BinderScene {
     }
     const table = hit || this.blockInput || Math.abs(this.pointer.x) > 1 ? null : this.pickTable();
     this.hoveredTable = table?.kind === 'binder' ? table.obj : null;
-    this.canvas.style.cursor = this.turn?.drag
+    this.canvas.style.cursor = this.turn?.drag || this.cardDragging
       ? 'grabbing'
       : hit || table
         ? 'pointer'
@@ -953,9 +1012,11 @@ export class BinderScene {
       const target = BASE_Y + (item === this.hoveredTable ? 0.6 : 0);
       item.position.y += (target - item.position.y) * (1 - Math.exp(-dt * 12));
     }
+    const hidden = this.hiddenSlot;
     for (const view of [this.left, this.right]) {
-      for (const c of view?.lifts ?? []) {
+      for (const [i, c] of (view?.lifts ?? []).entries()) {
         if (!c) continue;
+        c.visible = !(hidden && view!.pageIndex === hidden.page && hidden.slot === i);
         const target = c.userData.restZ + (c === card ? 0.035 : 0);
         c.position.z += (target - c.position.z) * (1 - Math.exp(-dt * 14));
         c.scale.setScalar(c.userData.baseScale * (1 + (c.position.z - c.userData.restZ) * 0.6));

@@ -1,4 +1,4 @@
-import type { FoilKey, Game } from './types';
+import type { CardRef, FoilKey, Game } from './types';
 
 /** Which part of the card carries the foil. */
 export enum Region {
@@ -247,6 +247,23 @@ export function printAge(game: Game, foil: FoilKey, age?: number) {
   return def === null ? 0 : (age ?? def);
 }
 
+/**
+ * Whether a card can have the old frame: Yu-Gi-Oh! cards except Link monsters,
+ * which never had one. Cards saved before \`kind\` existed have their type in
+ * \`set\`.
+ */
+export function hasOldFrame(card: CardRef) {
+  return card.game === 'ygo' && !/\bLink\b/.test(card.kind ?? card.set);
+}
+
+/** Yu-Gi-Oh! printings from before this date start with the old frame when put in a binder. */
+const OLD_FRAME_UNTIL = '2015-01-01';
+
+/** Whether a card put in a binder should start with the old frame: an old enough Yu-Gi-Oh! printing. */
+export function oldFrameByDefault(card: CardRef) {
+  return hasOldFrame(card) && !!card.released && card.released < OLD_FRAME_UNTIL;
+}
+
 export function foilLabel(game: Game, foil: FoilKey): string {
   return rarityOf(game, foil).label;
 }
@@ -268,14 +285,14 @@ export function normalizeFoil(game: Game, foil: string): FoilKey {
 export const CARD_BACK: Record<Game, string> = {
   pokemon: 'https://tcg.pokemon.com/assets/img/global/tcg-card-back-2x.jpg',
   mtg: 'https://backs.scryfall.io/large/0/a/0aeebaf5-8c7d-4636-9e82-8c27447861f7.jpg',
-  ygo: 'https://images.ygoprodeck.com/images/cards/back.jpg',
+  ygo: 'https://img.yugipedia.com/e/e5/Back-EN.png',
 };
 
 /** Physical card size in cm and corner radius as a fraction of height. */
 export const CARD_SIZE: Record<Game, { w: number; h: number; r: number }> = {
   mtg: { w: 6.3, h: 8.8, r: 0.036 },
   pokemon: { w: 6.3, h: 8.8, r: 0.036 },
-  ygo: { w: 5.9, h: 8.6, r: 0.02 },
+  ygo: { w: 5.9, h: 8.6, r: 0.012 },
 };
 
 /**
@@ -297,12 +314,12 @@ export const NAME_BOX: Record<Game, [number, number, number, number]> = {
 
 /**
  * Yu-Gi-Oh! frame parts, same convention as ART_BOX: the inside edge of the
- * outer border, the outside edge of the bevelled art frame, and the row of
- * level stars.
+ * outer border, the outside edge of the bevelled art frame (its dark outline,
+ * so effects on the frame stop where it does), and the row of level stars.
  */
 export const YGO_FRAME = {
   inner: [0.032, 0.022, 0.968, 0.978] as [number, number, number, number],
-  artFrame: [0.09, 0.165, 0.91, 0.725] as [number, number, number, number],
+  artFrame: [0.102, 0.171, 0.899, 0.715] as [number, number, number, number],
   stars: [0.06, 0.12, 0.94, 0.165] as [number, number, number, number],
   /** Bounding box of the round attribute icon, top right. */
   attr: [0.846, 0.04, 0.932, 0.11] as [number, number, number, number],

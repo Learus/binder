@@ -51,8 +51,8 @@
         <div class="row small">
           <span id="binder-stats"></span>
           <span class="spacer"></span>
-          <button id="sheet-remove" title="Remove the last sheet (2 pages)">− Sheet</button>
-          <button id="sheet-add" title="Add a sheet (2 pages)">+ Sheet</button>
+          <button id="sheet-remove" title="Remove the open pages (page 1 on the front cover)">− Sheet</button>
+          <button id="sheet-add" title="Insert empty pages here, moving the open ones right">+ Sheet</button>
         </div>
       </section>
 
@@ -63,9 +63,17 @@
           <button data-game="ygo">Yu-Gi-Oh!</button>
         </div>
         <form id="search-form" class="row">
-          <input id="search-input" type="search" placeholder="Search cards…" autocomplete="off" />
+          <div class="search-box">
+            <input id="search-input" type="search" placeholder="Search cards…" autocomplete="off" />
+            <button type="button" id="search-word" class="word-toggle" aria-pressed="false" title="Whole words only (ignores case)">ab</button>
+          </div>
           <button type="submit">Search</button>
         </form>
+        <div class="row filters">
+          <select id="search-type" title="Card type"></select>
+          <input id="search-set" list="search-sets" placeholder="Any set" autocomplete="off" title="Set: type to find one" />
+          <datalist id="search-sets"></datalist>
+        </div>
         <label class="row small">
           <span>Rarity for new cards</span>
           <select id="foil-select"></select>
@@ -86,9 +94,9 @@
         <button id="close-toggle" class="pill" title="Close or open the binder (C)">Close</button>
       </div>
       <div id="hint">
-        Click a pocket to select it, then click a search result to put a card there. Click a card to look at it
-        up close. Ctrl+click a card to remove it, hover and press Ctrl+D to copy it. C closes the binder; click a
-        binder on the table to swap to it, or an empty slot to start a new one. Drag a page by its outer edge to
+        Click a pocket to select it, then click a search result to put a card there. Drag cards from the results or
+        between pockets (Shift copies, hold beside the binder to turn). Click a card to look at it up close. Ctrl+click a card to remove it, hover and press Ctrl+D to copy it. C closes the binder; click a
+        binder on the table to swap to it, or an empty slot to start a new one. Drag a page by its outer edge (between or beside the cards) to
         turn it, or type a page number to turn there. Right-drag to tilt the view, middle-drag to pan, scroll to zoom, R to reset the view, T to see the
         whole table.
       </div>
@@ -96,6 +104,11 @@
       <div id="inspect-panel" hidden>
         <div id="inspect-name"></div>
         <div id="inspect-set" class="small muted"></div>
+        <div class="row card-nav">
+          <button id="inspect-prev" title="Previous card (←)">‹ Prev</button>
+          <span id="inspect-pos" class="small muted"></span>
+          <button id="inspect-next" title="Next card (→)">Next ›</button>
+        </div>
         <label class="small">Rarity <select id="inspect-foil"></select></label>
         <label class="small" id="inspect-age-row" title="Older ultimate rares are greyer, with deeper relief">
           <span>Print age <span id="inspect-age-value" class="muted"></span></span>
@@ -104,6 +117,12 @@
         <label class="small check" id="inspect-old-row" title="Early prints have a shorter art window">
           <input type="checkbox" id="inspect-old" /> Old frame (smaller art)
         </label>
+        <div id="inspect-condition" class="small">
+          <span>Condition <span id="inspect-grade" class="muted"></span></span>
+          <div id="inspect-grades" class="grades" role="group" aria-label="Condition presets"></div>
+          <div id="inspect-wear" class="wear"></div>
+        </div>
+        <div id="inspect-prices" class="prices small"></div>
         <div class="row">
           <button id="inspect-flip">Flip</button>
           <button id="inspect-select" title="Select this pocket to replace the card">Replace…</button>
